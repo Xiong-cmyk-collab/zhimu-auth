@@ -1,5 +1,8 @@
-import { serveFile } from "jsr:@std/http/file-server";
-
-Deno.serve((req: Request) => {
-    return serveFile(req, "./index.html");
-});
+/* =====================================================================
+ * Deno Deploy 构建入口（GitHub 仓库路径）
+ * ---------------------------------------------------------------------
+ * 仓库里的 GitHub 构建走默认入口 src/main.ts。
+ * 根目录也放一份 main.ts，两种路径都能命中。
+ * 真正的逻辑在 ./deno/main.js。
+ * ===================================================================== */
+import './deno/main.js';
