@@ -674,7 +674,15 @@ async function route(req, env) {
   }
 
   try {
-    if (p === '/api/init')    return withJson(await handleInit(req, env), req, env);
+    /* ★ /api/init 已下线。
+       它是个**公开的**管理员创建接口：任何人 POST 一下就能造一个 admin 出来。
+       就算前端不露入口，接口本身也在，等于给站点留后门。
+       现在唯一的建号路径是管理后台（需要已有管理员会话 + Origin 白名单）。
+       env.ALLOW_INIT 只在本地回归测试里为 true，生产恒为 false。 */
+    if (p === '/api/init') {
+      if (!env.ALLOW_INIT) return fail('该接口已下线，请在管理后台添加账号', 410);
+      return withJson(await handleInit(req, env), req, env);
+    }
     if (p === '/api/login')   return withJson(await handleLogin(req, env), req, env);
     if (p === '/api/guest')   return withJson(await handleGuest(req, env), req, env);
     if (p === '/api/logout')  return withJson(await handleLogout(req, env), req, env);
