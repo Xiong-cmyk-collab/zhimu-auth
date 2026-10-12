@@ -105,11 +105,20 @@ try {
    重启（重新部署）后启动时从这里读回来。 */
 let kvConfig = {};
 let configSource = 'none';
-try {
-  if (dkv) {
-    const r = await dkv.get(['config', 'server'], { consistency: 'strong' });
-    if (r.value) kvConfig = r.value;
+async function loadKvConfig() {
+  if (!dkv) return {};
+  /* 强一致读优先；万一这个环境不认 consistency，退回默认读再试一次，
+     免得一次异常就默默当成「没配置」。 */
+  let r = null;
+  try { r = await dkv.get(['config', 'server'], { consistency: 'strong' }); }
+  catch (e) {
+    console.warn('强一致读配置失败，退回默认读：' + (e && e.message ? e.message : e));
+    try { r = await dkv.get(['config', 'server']); } catch (e2) { r = null; }
   }
+  return (r && r.value) ? r.value : {};
+}
+try {
+  kvConfig = await loadKvConfig();
 } catch (e) {
   console.warn('读 KV 配置失败：' + (e && e.message ? e.message : e));
 }
@@ -153,4 +162,30 @@ if (missing.length) {
 }
 
 /* Deno.serve 的第二个参数是连接信息，不是我们的 env，所以要用闭包包一层 */
-Deno.serve((req) => coreFetch(req, env), { port: 8000 });
+
+/* ★★ 惰性补配置：启动时读一次只是快路径，真正兜底的是这里。
+   之前只在启动时读，于是「引导写完 KV → 必须重启进程才生效」，
+   而重启要靠部署完成，部署又卡在 Deno 构建机拉 GitHub 上，
+   于是一环扣一环。现在改成：只要 env 里还是空的，第一次请求时
+   就自己去 KV 补，补上后立刻可用 —— 不用等重启。
+   写完 /api/bootstrap 之后，打一次任意请求就能看到效果。 */
+let cfgChecked = false;
+async function ensureConfig() {
+  if (cfgChecked) return;
+  cfgChecked = true;
+  if (env.SESSION_SECRET && env.MODEL_API_KEY) return;
+  const c = await loadKvConfig();
+  if (!c || !c.sessionSecret) return;
+  env.SESSION_SECRET = env.SESSION_SECRET || c.sessionSecret || '';
+  env.MODEL_API_KEY = env.MODEL_API_KEY || c.modelApiKey || '';
+  env.ALLOW_ORIGINS = env.ALLOW_ORIGINS || c.allowOrigins || '';
+  env.MODEL_API = env.MODEL_API || c.modelApi || 'https://api.minimax.chat/v1/text/chatcompletion_v2';
+  env.MODEL_NAME = env.MODEL_NAME || c.modelName || 'MiniMax-M3';
+  env.CONFIG_SOURCE = 'kv';
+  console.log('✅ 已从 KV 补齐配置');
+}
+
+Deno.serve(async (req) => {
+  try { await ensureConfig(); } catch (e) { /* 补不上就按原样跑，health 会如实报 */ }
+  return coreFetch(req, env);
+}, { port: 8000 });
