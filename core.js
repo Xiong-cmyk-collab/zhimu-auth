@@ -168,6 +168,11 @@ function safeEqual(a, b) {
   return d === 0;
 }
 
+async function sha256Hex(s) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(s)));
+  return toHex(d);
+}
+
 function token() {
   return (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, '');
 }
@@ -541,6 +546,38 @@ async function handleInit(req, env) {
   return json({ ok: true, msg: '管理员已创建，请用它登录', name });
 }
 
+/* ---------- 一次性引导：把服务端配置写进 KV ----------
+   为什么需要：Deno 控制台的环境变量入口在这个控制台上找不到，
+   而 deno deploy env add 在 0.0.9908 里是坏的（env 子命令不接受参数）。
+   所以改成：启动时先读 KV，KV 里没有再等一次引导写入。
+   安全模型：仓库是公开的，里面只放口令的 SHA-256；口令本身只有本地有，
+   哈希不可逆，攻击者读得到代码也猜不出口令。写成功后此接口永久关闭。 */
+async function handleBootstrap(req, env) {
+  if (req.method !== 'POST') return fail('仅支持 POST', 405);
+  let b;
+  try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+
+  const presented = String(b.token || '');
+  if (!env.BOOTSTRAP_HASH) return fail('服务端没配引导口令哈希，引导接口不可用', 500);
+  const h = await sha256Hex(presented);
+  if (!safeEqual(h, String(env.BOOTSTRAP_HASH))) return fail('引导口令不对', 401);
+
+  const exists = await env.KV.get('config:server', 'json');
+  if (exists) return fail('已经初始化过了，引导接口已关闭', 409);
+
+  const cfg = {
+    sessionSecret: String(b.sessionSecret || ''),
+    modelApiKey: String(b.modelApiKey || ''),
+    allowOrigins: String(b.allowOrigins || ''),
+    bootstrappedAt: Date.now()
+  };
+  if (cfg.sessionSecret.length < 32) return fail('sessionSecret 至少 32 位');
+  if (!cfg.modelApiKey) return fail('modelApiKey 不能为空');
+
+  await env.KV.put('config:server', JSON.stringify(cfg));
+  return json({ ok: true, msg: '配置已写入 KV，需要重新部署一次才会生效' });
+}
+
 /* ---------- 大模型 API 代理（★ API Key 只存在服务端）---------- */
 async function handleProxy(req, env) {
   const s = await getSession(req, env);
@@ -606,6 +643,7 @@ async function fetch(req, env) {
     if (p === '/api/guest')   return withJson(await handleGuest(req, env), req, env);
     if (p === '/api/logout')  return withJson(await handleLogout(req, env), req, env);
     if (p === '/api/session') return withJson(await handleSession(req, env), req, env);
+    if (p === '/api/bootstrap') return withJson(await handleBootstrap(req, env), req, env);
     if (p === '/api/proxy')   return handleProxy(req, env);
     if (p === '/api/admin/users') return withJson(await handleAdminUsers(req, env, p), req, env);
     if (p.startsWith('/api/admin/users/')) {
@@ -626,6 +664,9 @@ async function fetch(req, env) {
         ok: true, kv: kvOk, kvError: kvErr || env.KV_ERROR || '',
         kvMissing: !!env.KV._dead,
         strongRead: typeof env.KV._strong === 'function' ? env.KV._strong() : null,
+        configured: !!(env.SESSION_SECRET && env.MODEL_API_KEY),
+        hasSecret: !!env.SESSION_SECRET, hasModelKey: !!env.MODEL_API_KEY,
+        configSource: env.CONFIG_SOURCE || 'none',
         admin: !!admin, runtime: env.RUNTIME || 'unknown'
       });
     }
