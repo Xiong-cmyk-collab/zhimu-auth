@@ -46,10 +46,27 @@ const kSess = (jti) => `sess:${jti}`;
 const kIp = (ip) => `ip:${encodeURIComponent(ip || 'unknown')}`;
 const kUid = (n) => `uid:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const kLock = (ip) => `lock:${encodeURIComponent(ip)}`;
+/* ★ 被强制下线的 IP：拉黑名单，冷却期内该 IP 登不进来。
+   key 是 kick:<ip>，值 { ip, at, until, by, name }，用 TTL 自然过期。
+   ★ 只有拿得到真实 IP 时才写这条：Deno Deploy 不下发客户端 IP，所有人
+     都记成 unknown，那是全站共享的一个桶，拉黑它等于封掉所有人。 */
+const kKick = (ip) => `kick:${encodeURIComponent(ip || 'unknown')}`;
+/* ★ 账号级冷却：key 是 kickn:<账号名>，值同 kick。
+   拿不到真实 IP 时（unknown）靠这条兜底——否则「强制下线」退化成
+   「下次刷新就回来」。IP 和账号双写，任一条生效就拦住。 */
+const kKickName = (n) => `kickn:${encodeURIComponent(String(n || '').trim().toLowerCase())}`;
+/* ★ 拥有者登录过的 IP：白名单，永不拉黑。
+   拥有者换了 IP 登录会自动多登记一条；TTL 与会话一致，
+   过期后不再登录就不再豁免（避免永久留后门）。 */
+const kOwnerIp = (ip) => `ownerip:${encodeURIComponent(ip)}`;
+
+/** 拿不到真实客户端 IP 时各平台给的都是 'unknown'，那不是「一个 IP」，是「没有 IP」。 */
+const isRealIp = (ip) => !!ip && ip !== 'unknown' && ip !== 'UNKNOWN';
 
 const TTL_SESSION = 60 * 60 * 24 * 7;      /* 正常会话 7 天 */
 const TTL_GUEST = 8 * 60;                  /* ★ 游客 8 分钟 */
 const TTL_GUEST_IP = 6 * 60 * 60;          /* ★ 同 IP 游客冷却 6 小时 */
+const KICK_COOLDOWN = 6 * 60 * 60;         /* ★ 被强制下线的 IP 冷却 6 小时 */
 const PBKDF2_ITER_DEFAULT = 100000;
 
 /* ---------- 基础工具 ---------- */
@@ -260,6 +277,22 @@ async function handleLogin(req, env) {
 
   if (!name || !pwd) return fail('请填写账号与密码');
 
+  /* ★ 被强制下线的 IP：6 小时内一律登不进来。
+     没有这条的话，被踢的人换个浏览器/清个 Cookie 就能立刻回来，
+     「强制下线」等于没踢。解除只能由拥有者在管理台手动放行。
+     只有拿得到真实 IP 才拦；ip 为 unknown 时这是个全站共享桶，拦它等于拦所有人。 */
+  if (isRealIp(ip)) {
+    const kicked = await env.KV.get(kKick(ip), 'json');
+    if (kicked && Date.now() < (kicked.until || 0)) {
+      const mins = Math.max(1, Math.ceil(((kicked.until - Date.now()) / 60000)));
+      return json({
+        ok: false, error: 'ip_cooldown',
+        msg: '本机 IP（' + ip + '）因被强制下线，' + mins + ' 分钟内无法登录。'
+          + '若你换了账号仍然如此，说明是同 IP 的其他人被踢了。'
+      }, 429);
+    }
+  }
+
   /* 暴力破解限速：同一 IP 连续失败 5 次锁 10 分钟 */
   const lockKey = kLock(ip);
   const lock = await env.KV.get(lockKey);
@@ -282,13 +315,49 @@ async function handleLogin(req, env) {
 
   await env.KV.delete(lockKey);
 
+  /* ★ 账号级冷却：拿不到真实 IP 时这是唯一的拦截手段。
+     放在口令校验之后：放前面的话，不带口令的人挨个试就能知道
+     「哪些账号正在被踢」，等于开了一个账号状态查询接口。
+     拥有者账号豁免——能删这条冷却记录的只有拥有者本人，
+     万一记上了就是永久自锁，谁也救不了。 */
+  if (user.role !== 'owner') {
+    const kickedName = await env.KV.get(kKickName(user.name), 'json');
+    if (kickedName && Date.now() < (kickedName.until || 0)) {
+      const mins = Math.max(1, Math.ceil(((kickedName.until - Date.now()) / 60000)));
+      return json({
+        ok: false, error: 'account_cooldown',
+        msg: '账号 ' + user.name + ' 因被强制下线，' + mins + ' 分钟内无法登录。'
+          + '若你不是本人操作，请联系拥有者。'
+      }, 429);
+    }
+  }
+
+  /* ★ 拥有者登录过的 IP 登记为白名单：这条 IP 永不被拉黑。
+     必须放在「同 IP 复用会话」那条捷径之前，否则复用命中时不会走到这里。
+     白名单只认「拥有者本人登录」这一件事——别人冒充 owner 账号是没用的，
+     因为口令校验在更前面就过了。 */
+  if (isRealIp(ip) && user.role === 'owner') {
+    await env.KV.put(kOwnerIp(ip), JSON.stringify({
+      ip, name: user.name, at: Date.now()
+    }), { expirationTtl: TTL_SESSION });
+  }
+
   /* ★ 同 IP 已有「同一个账号」的有效会话 → 直接复用（不必再走一遍会话写入）。
      必须比对账号名：只判断「这个 IP 上有会话」的话，
-     共享 IP（办公室/网吧）下任何人输任意账号都会被换成已登录者的身份。 */
+     共享 IP（办公室/网吧）下任何人输任意账号都会被换成已登录者的身份。
+
+     ★ 还必须确认这条令牌没被作废。verifyToken 只验签名和过期，
+       被踢 / 单点登录顶掉的令牌签名照样是好的；不复核 uid 指针的话，
+       这里会把一条死令牌递回去 —— 登录显示成功，下一个请求就 401，
+       表现就是「怎么都登不进去」，而且换个浏览器也一样。 */
   const ipRec = await env.KV.get(kIp(ip), 'json');
   if (ipRec && ipRec.token && !ipRec.guest && ipRec.name === user.name) {
     const p = await verifyToken(ipRec.token, env.SESSION_SECRET);
-    if (p && !p.g && p.n === user.name && Date.now() < p.e) {
+    const ptr = p ? await env.KV.get(kUid(user.name), 'json') : null;
+    /* 指针缺失也算作废：宁可重新签一个，也别递一条可能已经作废的 */
+    const alive = p && !p.g && p.n === user.name && Date.now() < p.e
+      && ptr && ptr.jti === p.j && ptr.token === ipRec.token && ptr.token;
+    if (alive) {
       return json({
         ok: true, reused: true, user: pubUser(p.n, p.r), token: ipRec.token,
         expireAt: p.e, guest: false
@@ -596,7 +665,44 @@ async function handleKick(req, env, path) {
     return fail('拥有者账号不能被强制下线', 403);
   }
   await env.KV.delete(kSess(jti));
+  /* 这两个要报给管理员看，必须声明在 if 外面；
+     尤其别在块里再 let 一遍 —— 内层会遮蔽外层，report 里就成了空字符串。 */
+  let ipBanned = false;
+  let why = s.guest ? '游客会话，只断开不写冷却' : '';
   if (!s.guest) {
+    /* 目标是拥有者账号时只断会话、不写任何冷却。
+       理由和登录侧那道豁免一样：能删冷却的只有拥有者本人，
+       给自己记一条就是把自己永久锁在门外。 */
+    const targetIsOwner = isOwner(s) || await isOwnerName(env, s.name);
+    if (targetIsOwner) why = '目标是拥有者账号，只断会话不写冷却（否则拥有者会把自己锁死）';
+
+    /* ★ 先判断「能不能安全地拉黑这个 IP」，再决定写哪一条冷却。
+         - 拿得到真实 IP、且没有拥有者从这儿登录过 → 拉黑 IP（正常语义）
+         - 拿不到真实 IP（unknown，全站共享桶）    → 不能拉黑，改按账号
+         - 这个 IP 是拥有者登录过的                → 永不拉黑，改按账号
+       「被踢的人换个 IP 还能登回来」是设计如此：需求就是「被强制下线的
+       IP 冷却 6 小时」，封的是 IP 不是账号。账号级冷却只在 IP 不能封时兜底。 */
+    if (!targetIsOwner) {
+      if (!isRealIp(s.ip)) {
+        why = '拿不到真实 IP（记为 unknown，这是全站共享桶），不拉黑 IP，改为按账号冷却';
+      } else if (await env.KV.get(kOwnerIp(s.ip), 'json')) {
+        why = '该 IP 是拥有者登录过的，永不拉黑，改为按账号冷却';
+      }
+    }
+
+    const rec = {
+      kind: 'ip', ip: s.ip, name: s.name, role: s.role, jti,
+      at: Date.now(), until: Date.now() + KICK_COOLDOWN * 1000,
+      by: admin.name
+    };
+    if (!why) {
+      await env.KV.put(kKick(s.ip), JSON.stringify(rec), { expirationTtl: KICK_COOLDOWN });
+      ipBanned = true;
+    } else if (!targetIsOwner) {
+      await env.KV.put(kKickName(s.name),
+        JSON.stringify({ ...rec, kind: 'account' }), { expirationTtl: KICK_COOLDOWN });
+    }
+
     await env.KV.put(kUid(s.name), JSON.stringify({
       ip: s.ip, token: '', jti: '__kicked__', iat: Date.now(),
       role: s.role, enabled: true
@@ -614,7 +720,8 @@ async function handleKick(req, env, path) {
       }), { expirationTtl: 60 });
     }
   }
-  return json({ ok: true });
+  /* 告诉管理员这次到底拦了什么，别让人以为「拉黑了 IP」却发现同事还能登 */
+  return json({ ok: true, ipBanned, note: why || undefined });
 }
 
 /* ---------- 首次初始化管理员 ---------- */
@@ -668,6 +775,112 @@ async function handleBootstrap(req, env) {
 
   await env.KV.put('config:server', JSON.stringify(cfg));
   return json({ ok: true, msg: '配置已写入 KV，需要重新部署一次才会生效' });
+}
+
+/* ---------- 被踢 IP 名单（仅拥有者） ---------- */
+
+/** 列出所有处于冷却期的被踢 IP —— 只有拥有者能看/能放行。
+ *  这张表是「IP 放行」这个运维动作的唯一入口，所以权限必须卡死在服务端。 */
+async function handleKickedIps(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+  if (!isOwner(admin)) return fail('只有拥有者可以查看和解除被踢 IP', 403);
+
+  /* 两类冷却都要列出来：kick:（IP 级）和 kickn:（账号级）。
+     拿不到真实 IP 时只有账号级会命中，只列一种会让管理台显示「名单是空的」，
+     看上去像没踢，实际谁都登不回来。 */
+  const rows = [];
+  const now = Date.now();
+  const collect = async (prefix, kind) => {
+    const list = await env.KV.list({ prefix });
+    for (const k of list.keys) {
+      const rec = await env.KV.get(k.name, 'json');
+      if (!rec || now >= (rec.until || 0)) { await env.KV.delete(k.name); continue; }
+      rows.push({
+        kind, ip: rec.ip || '', name: rec.name || '', by: rec.by || '',
+        at: rec.at, until: rec.until,
+        leftMinutes: Math.ceil((rec.until - now) / 60000)
+      });
+    }
+  };
+  await collect('kick:', 'ip');
+  await collect('kickn:', 'account');
+
+  /* 拥有者登录过的 IP 在名单里标出来：这些是真 IP，但永不会被拦，
+     放行按钮对它们是空操作，标一下免得运维对着它纳闷。 */
+  for (const r of rows) {
+    if (r.kind === 'ip' && isRealIp(r.ip)) {
+      r.ownerProtected = !!(await env.KV.get(kOwnerIp(r.ip), 'json'));
+    }
+  }
+  rows.sort((a, b) => (b.at || 0) - (a.at || 0));
+  return json({ ok: true, cooldownHours: KICK_COOLDOWN / 3600, kicked: rows });
+}
+
+/** 手动放行：既可以按 IP 放，也可以按账号放（拿不到真实 IP 时只能按账号）。 */
+async function handleUnblockIp(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+  if (!isOwner(admin)) return fail('只有拥有者可以解除被踢 IP', 403);
+  if (req.method !== 'POST') return fail('仅支持 POST', 405);
+
+  let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const ip = String(b.ip || '').trim();
+  const name = String(b.name || '').trim();
+  const kind = String(b.kind || (ip ? 'ip' : name ? 'account' : '')).trim();
+  if (!kind || (!ip && !name)) return fail('缺少 ip 或 name 参数');
+
+  const hit = [];
+  const cleared = [];        /* 被解掉账号的 { name, role }，用来抬单点登录指针 */
+  const unblockAccount = async (nm, role) => {
+    const r = await env.KV.get(kKickName(nm), 'json');
+    if (r) {
+      await env.KV.delete(kKickName(nm));
+      hit.push(nm);
+      cleared.push({ name: r.name || nm, role: r.role || role || 'user' });
+    }
+  };
+
+  if (kind === 'account') {
+    if (!name) return fail('按账号放行需要 name');
+    await unblockAccount(name);
+  } else {
+    if (!ip) return fail('按 IP 放行需要 ip');
+    const r = await env.KV.get(kKick(ip), 'json');
+    if (r) { await env.KV.delete(kKick(ip)); hit.push(ip); }
+    /* 放行 IP 时顺手把该 IP 上所有账号级冷却也清了：
+       用户在管理台看到的是一行，恢复就该恢复干净。 */
+    const all = await env.KV.list({ prefix: 'kickn:' });
+    for (const k of all.keys) {
+      const rec = await env.KV.get(k.name, 'json');
+      if (rec && rec.ip === ip) await unblockAccount(rec.name || '', rec.role);
+    }
+    /* 顺手把该 IP 的「同 IP 复用」记录也清掉，
+       否则放行之后他第一次登录还会拿到之前那条旧令牌。 */
+    const ipRec = await env.KV.get(kIp(ip), 'json');
+    if (ipRec) {
+      await env.KV.put(kIp(ip), JSON.stringify({
+        token: '', jti: '', guest: false, name: ipRec.name, lastGuestAt: ipRec.lastGuestAt || 0
+      }), { expirationTtl: 60 });
+    }
+  }
+
+  /* 被踢的那些账号的单点登录指针也抬一下，让他们能干净地重新登录 */
+  for (const c of cleared) {
+    const uid = await env.KV.get(kUid(c.name), 'json');
+    if (!uid || uid.jti !== '__kicked__') continue;
+    await env.KV.put(kUid(c.name), JSON.stringify({
+      ip: '', token: '', jti: '__unblocked__', iat: Date.now(),
+      role: c.role, enabled: true
+    }), { expirationTtl: TTL_SESSION });
+  }
+
+  if (!hit.length) return json({ ok: true, note: '该记录本来就不在冷却中' });
+  return json({ ok: true, msg: '已解除 ' + hit.join('、') + ' 的登录限制' });
 }
 
 /* ---------- 大模型 API 代理（★ API Key 只存在服务端）---------- */
@@ -764,6 +977,9 @@ async function route(req, env) {
       return withJson(await handleAdminUsers(req, env, p), req, env);
     }
     if (p === '/api/admin/online') return withJson(await handleOnline(req, env), req, env);
+    /* 被踢 IP 名单 + 手动放行：仅拥有者 */
+    if (p === '/api/admin/kicked-ips') return withJson(await handleKickedIps(req, env), req, env);
+    if (p === '/api/admin/unblock-ip') return withJson(await handleUnblockIp(req, env), req, env);
     if (p.startsWith('/api/admin/kick/')) {
       return withJson(await handleKick(req, env, p), req, env);
     }
