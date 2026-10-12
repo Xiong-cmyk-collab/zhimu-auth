@@ -1,0 +1,96 @@
+/* =====================================================================
+ * Deno Deploy 入口
+ * =====================================================================
+ * core.js 是平台无关的，这里只干两件事：
+ *   1. 把 Deno KV 包成 core.js 期望的那套 Cloudflare-KV 风格接口
+ *      —— 这样 core.js 里 60 多处 env.KV.* 调用一行都不用改
+ *   2. 从环境变量拼出 env 对象
+ *
+ * ★ 为什么用强一致读（consistency: 'strong'）
+ * Deno KV 默认最终一致（全球 60s 内同步）。登录后紧接着的请求如果
+ * 落在另一个边缘节点，可能读不到刚写的单点登录指针。
+ * 强一致读直接消掉这个问题。内部工具量很小，读单元完全够用。
+ * core.js 里那条「iat 比令牌新才作废」的规则保留着当双保险。
+ * ===================================================================== */
+
+import { fetch as coreFetch } from '../core.js';
+
+/* ★ 键的形态转换
+   Cloudflare KV 的键是字符串（'sess:abc'），Deno KV 的键是**数组**
+   （['sess','abc']）。直接传字符串会报
+   「serde_v8 error: invalid type; expected: array, got: string」。
+   core.js 里所有键都是 `<类型>:<值>` 形式，且用户输入部分一律经过
+   encodeURIComponent（':' 会变成 %3A），所以按 ':' 拆分是无损的，
+   list 的前缀语义也能对上（prefix 'sess:' → ['sess'] 精确前缀匹配）。 */
+const toKey = (k) => (Array.isArray(k) ? k : String(k).split(':'));
+const toStr = (a) => (Array.isArray(a) ? a.join(':') : String(a));
+
+function mkKV(dkv) {
+  /* 强一致读在 Deno Deploy 上原生支持；本地 SQLite 版 Deno KV 不认这个参数。
+     第一次踩到就把强一致关掉，降级成默认读，保证任何环境都不会因为
+     「传了个不支持的 option」而整个挂掉。 */
+  const state = { strong: true };
+  const read = async (key) => {
+    if (state.strong) {
+      try { return await dkv.get(key, { consistency: 'strong' }); }
+      catch (e) { state.strong = false; console.warn('KV 不支持强一致读，降级为默认读：' + (e && e.message)); }
+    }
+    return await dkv.get(key);
+  };
+  return {
+    _strong: () => state.strong,
+    async get(key, opts) {
+      const r = await read(toKey(key));
+      const v = r.value;
+      if (v === null || v === undefined) return null;
+      if (opts === 'json') {
+        try { return JSON.parse(v); } catch (e) { return null; }
+      }
+      return v;
+    },
+
+    async put(key, value, opts) {
+      /* Cloudflare 用 expirationTtl（秒），Deno 用 expireIn（毫秒） */
+      const o = {};
+      if (opts && opts.expirationTtl) {
+        o.expireIn = Math.max(1000, Math.round(opts.expirationTtl * 1000));
+      }
+      await dkv.set(toKey(key), String(value), o);
+    },
+
+    async delete(key) { await dkv.delete(toKey(key)); },
+
+    async list({ prefix } = {}) {
+      const keys = [];
+      const opt = prefix ? { prefix: toKey(prefix) } : {};
+      for await (const e of dkv.list(opt)) {
+        keys.push({ name: toStr(e.key) });
+      }
+      return { keys };
+    }
+  };
+}
+
+const dkv = await Deno.openKv();
+
+const env = {
+  KV: mkKV(dkv),
+  SESSION_SECRET: Deno.env.get('SESSION_SECRET') || '',
+  MODEL_API: Deno.env.get('MODEL_API') || '',
+  MODEL_NAME: Deno.env.get('MODEL_NAME') || '',
+  MODEL_API_KEY: Deno.env.get('MODEL_API_KEY') || '',
+  ALLOW_ORIGINS: Deno.env.get('ALLOW_ORIGINS') || '',
+  PBKDF2_ITER: Deno.env.get('PBKDF2_ITER') || '',
+  RUNTIME: 'deno-deploy'
+};
+
+const missing = ['SESSION_SECRET', 'MODEL_API_KEY', 'ALLOW_ORIGINS']
+  .filter((k) => !env[k]);
+if (missing.length) {
+  console.error('⚠ 缺少环境变量：' + missing.join(', ') + ' —— 对应功能会不可用');
+} else {
+  console.log('✅ 环境变量齐全，KV 已连接');
+}
+
+/* Deno.serve 的第二个参数是连接信息，不是我们的 env，所以要用闭包包一层 */
+Deno.serve((req) => coreFetch(req, env), { port: 8000 });
