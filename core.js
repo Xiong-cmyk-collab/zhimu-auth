@@ -184,8 +184,25 @@ function readCookie(req, name) {
   return hit ? decodeURIComponent(hit.slice(name.length + 1)) : '';
 }
 
+/* ★ 必须 SameSite=None。
+   站点在 space.mcode.cn、网关在 deno.net —— 这是**跨站**。
+   SameSite=Lax 的规则是「跨站子请求既不发送也不存储 Cookie」，
+   于是 /api/session 请求到网关时根本没带 Cookie → 401 →
+   主页面跳登录页、登录页跳回来 → 无限闪屏。
+   None + Secure 是跨站 Cookie 认证的硬性要求（Secure 不能省）。
+   因为放开成跨站了，必须配套 CSRF 防护，见 assertSameOrigin()。 */
 function setCookie(tk, maxAge) {
-  return `ztk=${tk}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+  return `ztk=${tk}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=None`;
+}
+
+/* ★ CSRF 防护：Cookie 既然允许跨站带了，就必须校验来源。
+   带 Origin 头且不在白名单里的写操作一律 403。
+   （同站部署时浏览器可能不带 Origin，此时放行 —— 那本来就不是跨站攻击面。） */
+function assertSameOrigin(req, env) {
+  const origin = req.headers.get('Origin');
+  if (!origin) return null;                       /* 同站请求，没有 Origin */
+  if (corsOrigin(req, env)) return null;          /* 白名单里的来源 */
+  return fail('来源不被允许：' + origin, 403);
 }
 
 /* =====================================================================
@@ -350,6 +367,8 @@ async function handleGuest(req, env) {
 }
 
 async function handleLogout(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
   const s = await getSession(req, env);
   if (s) {
     await env.KV.delete(kSess(s.jti));
@@ -401,6 +420,8 @@ async function purgeUserSessions(env, name) {
 }
 
 async function handleAdminUsers(req, env, path) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
   const admin = await isAdmin(req, env);
   if (!admin) return fail('需要管理员权限', 403);
 
@@ -489,6 +510,8 @@ async function handleAdminUsers(req, env, path) {
 
 /** 在线会话：扫 sess: 前缀。只给管理后台看，允许几十秒的最终一致延迟。 */
 async function handleOnline(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
   const admin = await isAdmin(req, env);
   if (!admin) return fail('需要管理员权限', 403);
   const list = await env.KV.list({ prefix: 'sess:' });
@@ -509,6 +532,8 @@ async function handleOnline(req, env) {
 
 /** 强制下线 */
 async function handleKick(req, env, path) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
   const admin = await isAdmin(req, env);
   if (!admin) return fail('需要管理员权限', 403);
   if (req.method !== 'POST') return fail('仅支持 POST', 405);
@@ -580,6 +605,10 @@ async function handleBootstrap(req, env) {
 
 /* ---------- 大模型 API 代理（★ API Key 只存在服务端）---------- */
 async function handleProxy(req, env) {
+  /* Cookie 现在允许跨站带了，所以每个会改状态/动用额度的接口都要先验来源 */
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+
   const s = await getSession(req, env);
   if (!s) return json({ ok: false, error: '登录已失效，请重新登录' }, 401);
 
@@ -626,7 +655,14 @@ async function handleProxy(req, env) {
 }
 
 /* ---------- 路由 ---------- */
-async function fetch(req, env) {
+/* ★ 函数名不能叫 fetch。
+   模块级 `function fetch` 会遮蔽全局 fetch，于是 handleProxy 里那句
+   `fetch(target, init)` 会调到自己 —— 传进去的是个 URL 字符串，
+   字符串没有 .url → new URL(undefined) 直接抛「Invalid URL」。
+   结果：代理接口只要真带着有效会话去调模型就必崩。
+   （冒烟测试没抓到，是因为测的是「未带会话→401」，走不到上游那行。）
+   改叫 route，全局 fetch 就露出来了。 */
+async function route(req, env) {
   const url = new URL(req.url);
   const p = url.pathname;
 
@@ -644,7 +680,10 @@ async function fetch(req, env) {
     if (p === '/api/logout')  return withJson(await handleLogout(req, env), req, env);
     if (p === '/api/session') return withJson(await handleSession(req, env), req, env);
     if (p === '/api/bootstrap') return withJson(await handleBootstrap(req, env), req, env);
-    if (p === '/api/proxy')   return handleProxy(req, env);
+    /* ★ 必须 await。写成 `return handleProxy(...)` 的话，Promise 会直接逃出
+       上面那个 try/catch —— handleProxy 里任何异步异常（上游网络错误之类）
+       都会变成未捕获的 Promise 拒绝，而不是我们准备好��� 500 JSON。 */
+    if (p === '/api/proxy')   return await handleProxy(req, env);
     if (p === '/api/admin/users') return withJson(await handleAdminUsers(req, env, p), req, env);
     if (p.startsWith('/api/admin/users/')) {
       return withJson(await handleAdminUsers(req, env, p), req, env);
@@ -686,5 +725,5 @@ function withJson(resp, req, env) {
   return new Response(resp.body, { status: resp.status, headers: h });
 }
 
-export { fetch, kUser, kName, kSess, kIp, kUid, kLock,
+export { route, kUser, kName, kSess, kIp, kUid, kLock,
          makeToken, verifyToken, TTL_SESSION, TTL_GUEST };

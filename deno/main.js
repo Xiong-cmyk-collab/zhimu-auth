@@ -13,7 +13,7 @@
  * core.js 里那条「iat 比令牌新才作废」的规则保留着当双保险。
  * ===================================================================== */
 
-import { fetch as coreFetch } from '../core.js';
+import { route as coreFetch } from '../core.js';
 import { toKey, toStr, toPrefix } from './kv-keys.js';
 
 /* 键名转换规则见同目录 kv-keys.js（抽成独立模块是为了能直接跑单测）：
