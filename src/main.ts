@@ -7,5 +7,8 @@
  * 服务端配置（SESSION_SECRET / MODEL_API_KEY / ALLOW_ORIGINS）优先读
  * Deno 环境变量，读不到就回落到 KV 里的 config:server
  * ——那是 /api/bootstrap 一次性写入的，写完该接口永久关闭。
+ *
+ * 部署完成后打 /api/health 应看到：
+ *   configured: true, configSource: "kv", hasSecret: true, hasModelKey: true
  * ===================================================================== */
 import '../deno/main.js';
