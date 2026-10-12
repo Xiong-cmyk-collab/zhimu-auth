@@ -191,6 +191,15 @@ function readCookie(req, name) {
    主页面跳登录页、登录页跳回来 → 无限闪屏。
    None + Secure 是跨站 Cookie 认证的硬性要求（Secure 不能省）。
    因为放开成跨站了，必须配套 CSRF 防护，见 assertSameOrigin()。 */
+/* ★ 清 Cookie 的属性必须和当初设置时**完全一致**（Path / Secure / SameSite），
+   否则浏览器不认这是同一个 Cookie，Max-Age=0 根本删不掉它。
+   我们当初为了跨站用的是 SameSite=None; Secure，删的时候也得原样带上。
+   少了 Secure 的症状是：点「退出登录」跳回登录页，登录页一查会话还在，
+   又自动跳回工作台 —— 用户看到的就是「退出后又自己进去了」。 */
+function clearCookie() {
+  return 'ztk=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None';
+}
+
 function setCookie(tk, maxAge) {
   return `ztk=${tk}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=None`;
 }
@@ -385,7 +394,7 @@ async function handleLogout(req, env) {
       token: '', guest: false, lastGuestAt: rec.lastGuestAt || 0
     }), { expirationTtl: 60 });
   }
-  return json({ ok: true }, 200, { 'Set-Cookie': 'ztk=; Path=/; Max-Age=0' });
+  return json({ ok: true }, 200, { 'Set-Cookie': clearCookie() });
 }
 
 /* ---------- 会话查询（前端启动时调；被挤下线时返回 ok:false）---------- */
@@ -406,7 +415,20 @@ async function isAdmin(req, env) {
   if (!s || s.guest) return null;
   const id = await env.KV.get(kName(s.name), 'json');
   const u = id ? await env.KV.get(kUser(id), 'json') : null;
-  return u && u.enabled && u.role === 'admin' ? u : null;
+  return u && u.enabled && (u.role === 'admin' || u.role === 'owner') ? u : null;
+}
+
+/* ★ 拥有者（owner）：比管理员高一级。
+   非拥有者的管理员对拥有者账号一律只能看、不能改 ——
+   踢下线、改密码、停用、删除、动角色，全部拦在服务端。 */
+const isOwner = (u) => !!(u && u.role === 'owner');
+
+/** 按账号名查它是不是拥有者（踢下线时用：会话里只有名字） */
+async function isOwnerName(env, name) {
+  const id = await env.KV.get(kName(name), 'json');
+  if (!id) return false;
+  const u = await env.KV.get(kUser(id), 'json');
+  return isOwner(u);
 }
 
 /** 清掉某用户在 sess: 里残留的会话记录。
@@ -443,7 +465,9 @@ async function handleAdminUsers(req, env, path) {
     let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
     const name = String(b.name || '').trim();
     const pwd = String(b.pwd || '');
-    const role = b.role === 'admin' ? 'admin' : 'user';
+    /* 拥有者只能由拥有者创建 —— 否则任何管理员都能给自己升权。 */
+    const role = (b.role === 'owner' && isOwner(admin)) ? 'owner'
+      : (b.role === 'admin' ? 'admin' : 'user');
     if (!name || !pwd) return fail('账号与密码都要填');
     if (name.length > 32) return fail('账号太长（最多 32 字符）');
     if (pwd.length < 6) return fail('密码至少 6 位');
@@ -464,9 +488,22 @@ async function handleAdminUsers(req, env, path) {
     let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
     const u = await env.KV.get(kUser(id), 'json');
     if (!u) return fail('账号不存在', 404);
+    /* ★ 拥有者保护 */
+    if (isOwner(u) && !isOwner(admin)) return fail('拥有者账号只能由拥有者本人修改', 403);
+    if (isOwner(u) && b.role && b.role !== 'owner') return fail('不能降级拥有者账号', 403);
+    if (isOwner(u) && b.enabled === false) return fail('不能停用拥有者账号', 403);
     let revoke = false;
     if (typeof b.enabled === 'boolean') u.enabled = b.enabled;
-    if (b.role) u.role = b.role === 'admin' ? 'admin' : 'user';
+    /* ★ 三档角色：owner / admin / user。
+       原来只认 'admin'，传 owner 会被静默打成 user —— 升权看着成功、
+       其实把人降级了，而且因为 owner 权限更大，升完之后反而什么都做不了。
+       「升 owner」只允许两种人做：本来就是拥有者的，
+       或者**给自己升**（首个拥有者的产生方式；给别人升一律压回 admin）。 */
+    if (b.role) {
+      const self = u.name === admin.name;
+      u.role = (b.role === 'owner' && (isOwner(admin) || self)) ? 'owner'
+        : (b.role === 'admin' ? 'admin' : 'user');
+    }
     if (b.pwd) {
       if (String(b.pwd).length < 6) return fail('密码至少 6 位');
       const { hash, salt } = await hashPassword(String(b.pwd), null, env);
@@ -492,6 +529,7 @@ async function handleAdminUsers(req, env, path) {
   if (req.method === 'DELETE') {
     const u = await env.KV.get(kUser(id), 'json');
     if (!u) return fail('账号不存在', 404);
+    if (isOwner(u) && !isOwner(admin)) return fail('拥有者账号不能被删除', 403);
     if (u.role === 'admin' && u.name === admin.name) return fail('不能删掉自己这个管理员');
     await env.KV.delete(kUser(id));
     await env.KV.delete(kName(u.name));
@@ -521,8 +559,21 @@ async function handleOnline(req, env) {
     const s = await env.KV.get(k.name, 'json');
     if (!s) continue;
     if (now > (s.expAt || 0)) { await env.KV.delete(k.name); continue; }
+    /* ★ 角色不能直接用会话里存的那份 —— 那是登录当时的快照，
+       管理员升成拥有者之后会话记录还写着 admin，在线列表会把
+       「不可踢」显示成「可踢」。这里按账号名回查一次真实角色。
+       管理员接口本来就低频，多一次读换正确性，值。 */
+    let role = s.role || 'user';
+    if (!s.guest) {
+      const uid = await env.KV.get(kName(s.name), 'json');
+      if (uid) {
+        const cur = await env.KV.get(kUser(uid), 'json');
+        if (cur && cur.role) role = cur.role;
+      }
+    }
     rows.push({
       jti: s.jti || k.name.slice(5), name: s.name, ip: s.ip, guest: !!s.guest,
+      role,
       loginAt: s.loginAt, leftMinutes: Math.max(0, Math.round((s.expAt - now) / 60000))
     });
   }
@@ -540,12 +591,28 @@ async function handleKick(req, env, path) {
   const jti = path.replace('/api/admin/kick/', '');
   const s = await env.KV.get(kSess(jti), 'json');
   if (!s) return json({ ok: true, note: '该会话已失效' });
+  /* ★ 拥有者保护：非拥有者的管理员踢不动拥有者 */
+  if (!s.guest && admin.role !== 'owner' && await isOwnerName(env, s.name)) {
+    return fail('拥有者账号不能被强制下线', 403);
+  }
   await env.KV.delete(kSess(jti));
   if (!s.guest) {
     await env.KV.put(kUid(s.name), JSON.stringify({
       ip: s.ip, token: '', jti: '__kicked__', iat: Date.now(),
       role: s.role, enabled: true
     }), { expirationTtl: TTL_SESSION });
+
+    /* ★ 还要清掉 kIp 里指向这个 token 的记录。
+       不清的话，被踢的人重新登录会命中「同 IP 复用会话」那条捷径，
+       又把那个已经作废的旧 token 递回去 → 登录成功但立刻 401，
+       表现就是「被踢之后再也登不回来」。 */
+    const ipRec = await env.KV.get(kIp(s.ip), 'json');
+    if (ipRec && ipRec.jti === jti) {
+      await env.KV.put(kIp(s.ip), JSON.stringify({
+        token: '', jti: '', guest: false, name: ipRec.name,
+        lastGuestAt: ipRec.lastGuestAt || 0
+      }), { expirationTtl: 60 });
+    }
   }
   return json({ ok: true });
 }
