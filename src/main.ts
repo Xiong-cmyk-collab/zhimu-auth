@@ -4,7 +4,8 @@
  * 平台构建器默认找 <仓库根>/src/main.ts。
  * 根目录另有一个 main.ts，两种路径都能命中。
  *
- * 部署前必须在控制台 Databases 页给这个 app 挂一个 KV 数据库，
- * 否则 Deno.openKv() 会失败（现在会降级启动，health 接口报 kvMissing）。
+ * 服务端配置（SESSION_SECRET / MODEL_API_KEY / ALLOW_ORIGINS）优先读
+ * Deno 环境变量，读不到就回落到 KV 里的 config:server
+ * ——那是 /api/bootstrap 一次性写入的，写完该接口永久关闭。
  * ===================================================================== */
 import '../deno/main.js';
