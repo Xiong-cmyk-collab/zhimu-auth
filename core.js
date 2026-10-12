@@ -624,6 +624,7 @@ async function handleOnline(req, env) {
   const list = await env.KV.list({ prefix: 'sess:' });
   const now = Date.now();
   const rows = [];
+  let pruned = 0;
   for (const k of list.keys) {
     const s = await env.KV.get(k.name, 'json');
     if (!s) continue;
@@ -633,7 +634,21 @@ async function handleOnline(req, env) {
        「不可踢」显示成「可踢」。这里按账号名回查一次真实角色。
        管理员接口本来就低频，多一次读换正确性，值。 */
     let role = s.role || 'user';
+    /* ★ 这条会话还算不算数，要看单点登录指针还指着它不指着。
+       sess: 记录在登录时写、只靠 TTL 自然过期，登出/踢人才删。
+       但「同一账号只能在一处登录」——后来那次登录会把 uid: 指针挪到新 jti，
+       旧令牌当场作废，旧 sess: 却还要在列表里挂 7 天。
+       结果就是「当前在线」里同一个人七八条，「剩余 7 天」整齐划一看着像
+       有很多活跃会话，其实只有最新那条能用；对着死会话点「强制下线」
+       也是白点（它早就死了），白让人以为没踢成功。
+       所以这里核对一次指针，指针不再指向它就当已失效，顺手清掉。 */
     if (!s.guest) {
+      const ptr = await env.KV.get(kUid(s.name), 'json');
+      if (!ptr || ptr.jti !== s.jti) {
+        await env.KV.delete(k.name);
+        pruned++;
+        continue;
+      }
       const uid = await env.KV.get(kName(s.name), 'json');
       if (uid) {
         const cur = await env.KV.get(kUser(uid), 'json');
@@ -647,7 +662,9 @@ async function handleOnline(req, env) {
     });
   }
   rows.sort((a, b) => (b.loginAt || 0) - (a.loginAt || 0));
-  return json({ ok: true, online: rows });
+  /* pruned 告诉管理台刚才顺手清了几条失效记录，界面上给个提示，
+     否则管理员会怀疑「我明明登过，怎么少了几条」。 */
+  return json({ ok: true, online: rows, pruned });
 }
 
 /** 强制下线 */
