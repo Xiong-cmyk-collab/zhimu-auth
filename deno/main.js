@@ -71,10 +71,37 @@ function mkKV(dkv) {
   };
 }
 
-const dkv = await Deno.openKv();
+/* 没挂 KV 数据库时不要让整个 isolate 崩掉 —— 否则连 /api/health 都打不开，
+   只能去翻构建日志。这里降级成一个「拒绝服务」的桩：健康检查会如实报
+   kv=false，其它接口一律 503，日志里也写清楚原因。 */
+/** KV 没挂时的降级桩：所有读写都抛，附带人话解释 */
+function mkDeadKV(reason) {
+  const boom = (op) => () => {
+    throw new Error('服务端没有挂 KV 数据库（' + op + ' 失败）：' + (reason || '未附加'));
+  };
+  return {
+    _strong: () => false,
+    _dead: true,
+    get: boom('读'),
+    put: boom('写'),
+    delete: boom('删'),
+    list: boom('列举'),
+  };
+}
+
+let dkv = null;
+let kvError = '';
+try {
+  dkv = await Deno.openKv();
+} catch (e) {
+  kvError = (e && e.message) ? String(e.message) : String(e);
+  console.error('⚠ 打不开 KV：' + kvError);
+  console.error('  去控制台 Databases 页面给这个 app 挂一个 KV 数据库，然后重新部署。');
+}
 
 const env = {
-  KV: mkKV(dkv),
+  KV: dkv ? mkKV(dkv) : mkDeadKV(kvError),
+  KV_ERROR: kvError,
   SESSION_SECRET: Deno.env.get('SESSION_SECRET') || '',
   MODEL_API: Deno.env.get('MODEL_API') || '',
   MODEL_NAME: Deno.env.get('MODEL_NAME') || '',
