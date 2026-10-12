@@ -1,7 +1,7 @@
 {
   "deploy": {
     "org": "xiong-cmyk-collab",
-    "app": "zhimu-auth"
+    "app": "zhimu-auth-2"
   },
   "tasks": {
     "dev": "deno run --unstable-kv --allow-net --allow-env --allow-read --allow-write main.ts"
