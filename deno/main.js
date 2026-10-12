@@ -14,16 +14,12 @@
  * ===================================================================== */
 
 import { fetch as coreFetch } from '../core.js';
+import { toKey, toStr, toPrefix } from './kv-keys.js';
 
-/* ★ 键的形态转换
-   Cloudflare KV 的键是字符串（'sess:abc'），Deno KV 的键是**数组**
-   （['sess','abc']）。直接传字符串会报
-   「serde_v8 error: invalid type; expected: array, got: string」。
-   core.js 里所有键都是 `<类型>:<值>` 形式，且用户输入部分一律经过
-   encodeURIComponent（':' 会变成 %3A），所以按 ':' 拆分是无损的，
-   list 的前缀语义也能对上（prefix 'sess:' → ['sess'] 精确前缀匹配）。 */
-const toKey = (k) => (Array.isArray(k) ? k : String(k).split(':'));
-const toStr = (a) => (Array.isArray(a) ? a.join(':') : String(a));
+/* 键名转换规则见同目录 kv-keys.js（抽成独立模块是为了能直接跑单测）：
+   toKey  → Cloudflare 字符串键转 Deno 数组键
+   toStr  → 反向
+   toPrefix → list 的前缀转换（必须单独处理，否则列表永远是空的） */
 
 function mkKV(dkv) {
   /* 强一致读在 Deno Deploy 上原生支持；本地 SQLite 版 Deno KV 不认这个参数。
@@ -62,7 +58,7 @@ function mkKV(dkv) {
 
     async list({ prefix } = {}) {
       const keys = [];
-      const opt = prefix ? { prefix: toKey(prefix) } : {};
+      const opt = prefix ? { prefix: toPrefix(prefix) } : {};
       for await (const e of dkv.list(opt)) {
         keys.push({ name: toStr(e.key) });
       }
