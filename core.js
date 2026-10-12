@@ -620,9 +620,11 @@ async function fetch(req, env) {
       let kvOk = false, kvErr = '';
       try { await env.KV.get('__health__'); kvOk = true; }
       catch (e) { kvErr = (e && e.message) ? String(e.message) : String(e); }
-      const admin = await isAdmin(req, env);
+      let admin = false;
+      try { admin = !!(await isAdmin(req, env)); } catch (e) { admin = false; }
       return json({
-        ok: true, kv: kvOk, kvError: kvErr,
+        ok: true, kv: kvOk, kvError: kvErr || env.KV_ERROR || '',
+        kvMissing: !!env.KV._dead,
         strongRead: typeof env.KV._strong === 'function' ? env.KV._strong() : null,
         admin: !!admin, runtime: env.RUNTIME || 'unknown'
       });
