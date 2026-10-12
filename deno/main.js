@@ -115,7 +115,18 @@ async function loadKvConfig() {
     console.warn('强一致读配置失败，退回默认读：' + (e && e.message ? e.message : e));
     try { r = await dkv.get(['config', 'server']); } catch (e2) { r = null; }
   }
-  return (r && r.value) ? r.value : {};
+  /* ★ 必须 JSON.parse。KV 里存的是 JSON 文本，直接把字符串丢给调用方的话，
+     调用方写 c.sessionSecret 永远是 undefined —— 配置看着「读到了」其实没读进来，
+     于是 configSource 永远是 none。 */
+  const raw = (r && r.value) ? r.value : '';
+  if (!raw) return {};
+  try {
+    const o = JSON.parse(raw);
+    return (o && typeof o === 'object') ? o : {};
+  } catch (e) {
+    console.warn('KV 里的配置不是合法 JSON：' + (e && e.message ? e.message : e));
+    return {};
+  }
 }
 try {
   kvConfig = await loadKvConfig();
