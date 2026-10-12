@@ -99,14 +99,47 @@ try {
   console.error('  去控制台 Databases 页面给这个 app 挂一个 KV 数据库，然后重新部署。');
 }
 
+/* 配置来源优先级：环境变量 > KV。
+   Deno 控制台的环境变量入口在当前版本找不到、CLI 的 env 子命令也是坏的，
+   所以留一条 KV 通道：/api/bootstrap 一次性写入 config:server，
+   重启（重新部署）后启动时从这里读回来。 */
+let kvConfig = {};
+let configSource = 'none';
+try {
+  if (dkv) {
+    const r = await dkv.get(['config', 'server'], { consistency: 'strong' });
+    if (r.value) kvConfig = r.value;
+  }
+} catch (e) {
+  console.warn('读 KV 配置失败：' + (e && e.message ? e.message : e));
+}
+
+const pick = (envName, kvKey) => {
+  const fromEnv = Deno.env.get(envName);
+  if (fromEnv) return { value: fromEnv, from: 'env' };
+  const fromKv = kvConfig[kvKey];
+  if (fromKv) return { value: String(fromKv), from: 'kv' };
+  return { value: '', from: 'none' };
+};
+
+const secret = pick('SESSION_SECRET', 'sessionSecret');
+const modelKey = pick('MODEL_API_KEY', 'modelApiKey');
+const origins = pick('ALLOW_ORIGINS', 'allowOrigins');
+if (secret.from === 'kv' || modelKey.from === 'kv' || origins.from === 'kv') configSource = 'kv';
+else if (secret.from === 'env' && modelKey.from === 'env') configSource = 'env';
+
 const env = {
   KV: dkv ? mkKV(dkv) : mkDeadKV(kvError),
   KV_ERROR: kvError,
-  SESSION_SECRET: Deno.env.get('SESSION_SECRET') || '',
-  MODEL_API: Deno.env.get('MODEL_API') || '',
-  MODEL_NAME: Deno.env.get('MODEL_NAME') || '',
-  MODEL_API_KEY: Deno.env.get('MODEL_API_KEY') || '',
-  ALLOW_ORIGINS: Deno.env.get('ALLOW_ORIGINS') || '',
+  CONFIG_SOURCE: configSource,
+  /* 引导口令的 SHA-256。仓库公开，但哈希不可逆 —— 只有本地知道原口令。 */
+  BOOTSTRAP_HASH: '13dd4f9c966522c4bf74aa03ee359abbe72453bc57c23d41ea9b5fd1653712b6',
+  SESSION_SECRET: secret.value,
+  MODEL_API: Deno.env.get('MODEL_API') || kvConfig.modelApi
+    || 'https://api.minimax.chat/v1/text/chatcompletion_v2',
+  MODEL_NAME: Deno.env.get('MODEL_NAME') || kvConfig.modelName || 'MiniMax-M3',
+  MODEL_API_KEY: modelKey.value,
+  ALLOW_ORIGINS: origins.value,
   PBKDF2_ITER: Deno.env.get('PBKDF2_ITER') || '',
   RUNTIME: 'deno-deploy'
 };
