@@ -1156,7 +1156,12 @@ async function handleProxy(req, env) {
   if (!key) return fail('服务端没有配置 MODEL_API_KEY', 500);
 
   const stream = !!body.stream;
-  const payload = { ...body, model: env.MODEL_NAME || body.model };
+  /* ★ 模型名：**前端指定优先**。
+     原来是 env.MODEL_NAME || body.model —— 服务端永远赢，
+     于是工作台上那个「模型接口」设置（每账号自选模型）根本推不动，
+     改了也白改。现在用户没指定时才回落到服务端默认，
+     **不修改任何全局配置**，只影响这一次请求。 */
+  const payload = { ...body, model: body.model || env.MODEL_NAME };
   const init = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
