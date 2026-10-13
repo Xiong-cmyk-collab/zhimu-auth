@@ -1068,8 +1068,21 @@ async function handlePx4Upload(req, env) {
   if (req.method !== 'POST') return fail('仅支持 POST', 405);
 
   let form;
+  /* ★ 必须把真实异常带出来。以前一律返回「上传内容解析失败」四个字，
+     现场表现是 ④ 区弹一句没头没尾的话、日志里什么都没有 ——
+     上线后第一版就踩过：前端给 FormData 请求显式写了
+     `Content-Type: application/json`（浏览器不会覆盖，于是 boundary 丢失），
+     req.formData() 抛的就是它。
+     现在把 Content-Type 和异常原文一起回传，下一次一眼能看出是哪一类。 */
   try { form = await req.formData(); }
-  catch (e) { return fail('上传内容解析失败'); }
+  catch (e) {
+    return json({
+      ok: false,
+      error: '上传内容解析失败（网关没能读懂这个请求）',
+      contentType: String(req.headers.get('content-type') || ''),
+      detail: String((e && e.message) || e).slice(0, 200)
+    }, 400);
+  }
 
   const file = form.get('file');
   if (!file || typeof file === 'string') return fail('没有收到 .ulg 文件');
