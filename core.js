@@ -63,6 +63,28 @@ const kOwnerIp = (ip) => `ownerip:${encodeURIComponent(ip)}`;
 /** 拿不到真实客户端 IP 时各平台给的都是 'unknown'，那不是「一个 IP」，是「没有 IP」。 */
 const isRealIp = (ip) => !!ip && ip !== 'unknown' && ip !== 'UNKNOWN';
 
+/* 「当前在线」的判定窗口。
+   ★ sess: 记录只靠 TTL 自然过期（7 天），用户关掉浏览器后记录还在、
+   单点登录指针也还对得上 —— 所以以前这个列表其实是
+   「持有有效登录令牌的账号」，不是「现在在线的人」。
+   表现就是明明有人早就走了，还挂着「剩余 7 天」排在最上面。
+   现在加一个轻量心跳（/api/ping），超过这个窗口没心跳的就不算在线。
+   取 15 分钟：比前端的 5 分钟心跳宽 3 倍，网络抖一下不会把人踢出列表。 */
+const ONLINE_WINDOW_MIN = 15;
+
+/* ★ 写「作废指针」时，i-iat 必须**严格大于**被作废令牌的签发时刻。
+   getSession 的作废判据是 (cur.iat > p.a) —— 严格大于，不是大于等于。
+   这里原来直接写 Date.now()：只要登录与「踢下线 / 改密码 / 删号」
+   落在**同一毫秒**，指针 iat 就会跟令牌的 issuedAt 完全相等，
+   判据不成立 → **被作废的令牌继续能用满 7 天**，而接口照样回 200。
+   现场表现是「强制下线时灵时不灵」，而且极难复现（Date.now() 只到毫秒）。
+   所以凡是抬高指针时间的地方一律过这个函数，下界取已知的最老签发时刻。 */
+function bumpIat(earliest) {
+  const now = Date.now();
+  const floor = (earliest || 0) + 1;      /* 至少要比下界新 1ms */
+  return now > floor ? now : floor;
+}
+
 const TTL_SESSION = 60 * 60 * 24 * 7;      /* 正常会话 7 天 */
 const TTL_GUEST = 8 * 60;                  /* ★ 游客 8 分钟 */
 const TTL_GUEST_IP = 6 * 60 * 60;          /* ★ 同 IP 游客冷却 6 小时 */
@@ -478,6 +500,34 @@ async function handleSession(req, env) {
   });
 }
 
+/* ---------- 在线心跳 ----------
+   ★ 为什么必须有它：sess: 记录只靠 TTL 自然过期（7 天）。
+     用户关掉浏览器、页面一关，令牌还在、记录还在、指针也对得上 ——
+     于是「当前在线」列出来的其实是「持有有效登录令牌的账号」，
+     明明早就下线的人还挂着「剩余 7 天」排在最上面。
+   工作台每 5 分钟（仅在页面可见时）打一次这个接口刷新 lastSeen，
+   管理台按「多久没心跳」判定在线与否。
+   成本：一次 KV 写 + 一个 204，空响应；60 秒内重复调用直接跳过写入。 */
+async function handlePing(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const s = await getSession(req, env);
+  if (!s) return json({ ok: false, error: 'no_session' }, 401);
+  if (Date.now() > s.expAt) return json({ ok: false, error: 'expired' }, 401);
+  const key = kSess(s.jti);
+  const now = Date.now();
+  const rec = (await env.KV.get(key, 'json')) || {
+    jti: s.jti, name: s.name, role: s.role, ip: s.ip,
+    guest: !!s.guest, loginAt: s.loginAt || now, lastSeen: 0
+  };
+  /* 防抖动：短时间内的重复心跳不重写，省掉无谓的 KV 写 */
+  if (now - (rec.lastSeen || 0) < 60000) return json({ ok: true, skipped: true });
+  rec.lastSeen = now;
+  rec.expAt = s.expAt;
+  await env.KV.put(key, JSON.stringify(rec), { expirationTtl: TTL_SESSION });
+  return json({ ok: true, lastSeen: now });
+}
+
 /* ---------- 管理后台 ---------- */
 async function isAdmin(req, env) {
   const s = await getSession(req, env);
@@ -510,6 +560,58 @@ async function purgeUserSessions(env, name) {
   }
 }
 
+/* ---------- Token 用量计量 ---------- */
+const kUsage = (name) => 'usage:' + name;
+
+/** 把一次调用的 usage 累加到该账号名下。计量失败绝不能影响用户拿结果，
+ *  所以内部全程吞异常，调用方也不用 await 它。 */
+async function addUsage(env, name, usage) {
+  try {
+    if (!name || !usage) return;
+    const p = Number(usage.prompt_tokens) || 0;
+    const c = Number(usage.completion_tokens) || 0;
+    const t = Number(usage.total_tokens) || (p + c);
+    if (!t && !p && !c) return;
+    const cur = (await env.KV.get(kUsage(name), 'json'))
+      || { total: 0, prompt: 0, completion: 0, calls: 0, at: 0 };
+    cur.total += t; cur.prompt += p; cur.completion += c;
+    cur.calls += 1; cur.at = Date.now();
+    await env.KV.put(kUsage(name), JSON.stringify(cur));
+  } catch (e) { /* 计量是旁路，坏了也不能拖垮主流程 */ }
+}
+
+/** 流式响应：从 SSE 里捞 usage。MiniMax 会在最后一个 chunk 里带 usage，
+ *  所以整段扫一遍只累加那一次。
+ *  用 tee() 分一支出来扫，另一支原样回给浏览器 —— 浏览器端代码一行不用改。 */
+async function scanStreamUsage(body, env, name) {
+  try {
+    const reader = body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (line.indexOf('data:') !== 0) continue;
+        const raw = line.slice(5).trim();
+        if (!raw || raw === '[DONE]') continue;
+        try {
+          const j = JSON.parse(raw);
+          if (j && j.usage) await addUsage(env, name, j.usage);
+        } catch (_) { /* 非 JSON 的心跳行，忽略 */ }
+      }
+    }
+  } catch (_) { /* 同上，旁路 */ }
+}
+
+/** 这次调用记在谁头上。游客也耗额度，单开一个桶，
+ *  否则游客白嫖的量在管理台完全看不见。 */
+const usageBucket = (s) => (s && !s.guest ? s.name : '__guest__');
+
 async function handleAdminUsers(req, env, path) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
@@ -521,22 +623,39 @@ async function handleAdminUsers(req, env, path) {
     const users = [];
     for (const k of list.keys) {
       const u = await env.KV.get(k.name, 'json');
-      if (u) users.push({
+      if (!u) continue;
+      /* ★ 用量一并带出来，管理台不用再发一次请求 */
+      const us = (await env.KV.get(kUsage(u.name), 'json'))
+        || { total: 0, prompt: 0, completion: 0, calls: 0, at: 0 };
+      users.push({
         id: u.id, name: u.name, role: u.role, enabled: !!u.enabled,
-        createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null
+        createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null,
+        usage: { total: us.total || 0, prompt: us.prompt || 0, completion: us.completion || 0,
+          calls: us.calls || 0, at: us.at || null }
       });
     }
     users.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-    return json({ ok: true, users });
+    const guest = (await env.KV.get(kUsage('__guest__'), 'json')) || null;
+    return json({ ok: true, users, guestUsage: guest ? (guest.total || 0) : 0 });
   }
 
   if (req.method === 'POST') {
     let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
     const name = String(b.name || '').trim();
     const pwd = String(b.pwd || '');
-    /* 拥有者只能由拥有者创建 —— 否则任何管理员都能给自己升权。 */
-    const role = (b.role === 'owner' && isOwner(admin)) ? 'owner'
-      : (b.role === 'admin' ? 'admin' : 'user');
+    /* ★★ 拥有者有且只有一个，且**只能由 /api/init 首次初始化产生**。
+       原来这里写的是「拥有者也能建拥有者」，于是拥有者可以无限增殖 ——
+       一个人开一堆小号全塞成 owner，普通管理员完全管不动。
+       现在前端不给这个选项，服务端也硬拦，两道都留。 */
+    if (b.role === 'owner') {
+      return fail('拥有者唯一，不可新增（拥有者由系统首次初始化时产生）', 403);
+    }
+    const role = (b.role === 'admin') ? 'admin' : 'user';
+    /* 这里不需要再扫一遍「系统里是不是已经有拥有者」——
+       上面那道 role==='owner' 的拒绝已经把唯一的造 owner 入口堵死了，
+       而 handleInit 建的是 admin、PUT 那头也堵了，三条路全断。
+       （曾经在这里加过一个「已有 owner 就拒绝」的兜底循环，
+        结果它对**每一个**建号都生效 —— 系统里有拥有者之后连普通用户都建不出来。）*/
     if (!name || !pwd) return fail('账号与密码都要填');
     if (name.length > 32) return fail('账号太长（最多 32 字符）');
     if (pwd.length < 6) return fail('密码至少 6 位');
@@ -561,6 +680,13 @@ async function handleAdminUsers(req, env, path) {
     if (isOwner(u) && !isOwner(admin)) return fail('拥有者账号只能由拥有者本人修改', 403);
     if (isOwner(u) && b.role && b.role !== 'owner') return fail('不能降级拥有者账号', 403);
     if (isOwner(u) && b.enabled === false) return fail('不能停用拥有者账号', 403);
+    /* ★★ 也不许把别人**升**成拥有者。升格是「新增一个拥有者」，
+       和 POST 的限制是同一件事 —— 只堵新增那一头等于留了个后门：
+       「先建成管理员，再改成拥有者」照样能造出第二个。
+       降级方向上面已经堵了，两头都堵才真正保证「有且只有一个」。 */
+    if (!isOwner(u) && b.role === 'owner') {
+      return fail('拥有者唯一，不可新增或提升（想移交请直接改数据库）', 403);
+    }
     let revoke = false;
     if (typeof b.enabled === 'boolean') u.enabled = b.enabled;
     /* ★ 三档角色：owner / admin / user。
@@ -585,7 +711,8 @@ async function handleAdminUsers(req, env, path) {
     /* 把指针时间戳往前推：已签发的令牌比它旧 → 下次请求即判失效 */
     const s = await env.KV.get(kUid(u.name), 'json');
     if (s) {
-      s.iat = Date.now();
+      /* 指针时间要严格新于它原先记的签发时刻（同毫秒就作废不掉，见 bumpIat） */
+      s.iat = bumpIat(s.iat);
       s.role = u.role;
       s.enabled = u.enabled !== false;
       if (revoke) s.jti = '__revoked__';
@@ -600,6 +727,8 @@ async function handleAdminUsers(req, env, path) {
     if (!u) return fail('账号不存在', 404);
     if (isOwner(u) && !isOwner(admin)) return fail('拥有者账号不能被删除', 403);
     if (u.role === 'admin' && u.name === admin.name) return fail('不能删掉自己这个管理员');
+    /* 墓碑要比「最后一次登录」新，否则同毫秒时删号作废不掉（见 bumpIat） */
+    const prev = await env.KV.get(kUid(u.name), 'json');
     await env.KV.delete(kUser(id));
     await env.KV.delete(kName(u.name));
     await purgeUserSessions(env, u.name);
@@ -607,7 +736,7 @@ async function handleAdminUsers(req, env, path) {
        删了的话 getSession 读到 null 会「放过」，被删账号的令牌还能再用 7 天。
        写一条新时间的墓碑才能让旧令牌判失效。 */
     await env.KV.put(kUid(u.name), JSON.stringify({
-      token: '', jti: '__deleted__', iat: Date.now(), role: u.role, enabled: false
+      token: '', jti: '__deleted__', iat: bumpIat(prev && prev.iat), role: u.role, enabled: false
     }), { expirationTtl: TTL_SESSION });
     return json({ ok: true });
   }
@@ -655,9 +784,15 @@ async function handleOnline(req, env) {
         if (cur && cur.role) role = cur.role;
       }
     }
+    /* ★ 真正判「在线」：看有没有心跳，不是看令牌还有没有效。
+       超窗的**不列出来，但也别删记录** —— 令牌还有效，管理员想作废它
+       应该用「停用 / 删除账号」，而不是对着一个离线会话点「强制下线」。
+       （删掉 sess: 反而会让「踢下线」这条路对离线用户失效。） */
+    const lastSeen = s.lastSeen || s.loginAt || 0;
+    if (now - lastSeen > ONLINE_WINDOW_MIN * 60000) continue;
     rows.push({
       jti: s.jti || k.name.slice(5), name: s.name, ip: s.ip, guest: !!s.guest,
-      role,
+      role, lastSeen,
       loginAt: s.loginAt, leftMinutes: Math.max(0, Math.round((s.expAt - now) / 60000))
     });
   }
@@ -721,7 +856,7 @@ async function handleKick(req, env, path) {
     }
 
     await env.KV.put(kUid(s.name), JSON.stringify({
-      ip: s.ip, token: '', jti: '__kicked__', iat: Date.now(),
+      ip: s.ip, token: '', jti: '__kicked__', iat: bumpIat(s.loginAt),
       role: s.role, enabled: true
     }), { expirationTtl: TTL_SESSION });
 
@@ -900,6 +1035,91 @@ async function handleUnblockIp(req, env) {
   return json({ ok: true, msg: '已解除 ' + hit.join('、') + ' 的登录限制' });
 }
 
+/* ---------- PX4 Flight Review 上传中转 ----------
+ *
+ * ★ 为什么必须有这个端点：logs.px4.io 一个 CORS 头都没有
+ *   （OPTIONS 直接 405，POST 的 302 里也没有 Access-Control-Allow-Origin），
+ *   浏览器直接跨域 POST 会被同源策略拦死，拿不到回跳里的 log id。
+ *   服务端发请求不受 CORS 限制，所以在网关这里中转一次。
+ *
+ * 用法：前端把 .ulg 原始字节 POST 过来，这里 multipart 转投给
+ *   https://logs.px4.io/upload（redirect=true → 302 到 plot_app?log=<uuid>），
+ *   把 uuid 抠出来回给前端，前端拿去 iframe ④ 区。
+ *
+ * 风险与限制（都写死在这里，不给前端留口子）：
+ *   - 这是把用户的飞行日志转发给第三方。站点按「不脱敏」策略设计，故默认开启；
+ *     若将来要改成必须用户点确认，只需在 config.js 关掉 openAutoUpload。
+ *   - 单文件上限 64MB（PX4 官方单次 SDLOG_MODE 最大 1024MiB 但没意义这么大）。
+ *   - 必须登录，且游客不给用（会白嫖 PX4 的服务器）。
+ *   - 不缓存、不落盘：字节只在内存里过一遍，转发完就丢。
+ */
+const PX4_FR_UPLOAD = 'https://logs.px4.io/upload';
+const PX4_MAX_UPLOAD = 64 * 1024 * 1024;
+
+async function handlePx4Upload(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+
+  const s = await getSession(req, env);
+  if (!s) return json({ ok: false, error: '登录已失效，请重新登录' }, 401);
+  /* 游客不给转发：这是白嫖第三方的服务器和带宽 */
+  if (s.guest) return json({ ok: false, error: '游客体验不能上传 Flight Review，请用正式账号' }, 403);
+  if (Date.now() > s.expAt) return json({ ok: false, error: '会话已到期，请重新登录' }, 401);
+  if (req.method !== 'POST') return fail('仅支持 POST', 405);
+
+  let form;
+  try { form = await req.formData(); }
+  catch (e) { return fail('上传内容解析失败'); }
+
+  const file = form.get('file');
+  if (!file || typeof file === 'string') return fail('没有收到 .ulg 文件');
+  const name = String(file.name || '').toLowerCase();
+  if (!name.endsWith('.ulg')) return fail('只接受 .ulg 文件（收到的是 ' + (name || '无名文件') + '）');
+  if (file.size > PX4_MAX_UPLOAD) {
+    return json({ ok: false, error: '文件太大：' + Math.round(file.size / 1048576)
+      + 'MB，上限 ' + Math.round(PX4_MAX_UPLOAD / 1048576) + 'MB' }, 413);
+  }
+
+  const buf = new Uint8Array(await file.arrayBuffer());
+  /* 转发前自己先验一遍文件头，别把垃圾数据丢给 PX4 */
+  const magic = String.fromCharCode(buf[0], buf[1], buf[2], buf[3]);
+  if (magic !== 'ULog') {
+    return fail('这不是 PX4 ULog 文件（文件头应为 "ULog"，实际是 "' + magic + '"');
+  }
+
+  /* multipart 重建：logs.px4.io 要的是 filearg / public / redirect / type / email */
+  const fd = new FormData();
+  fd.set('filearg', new Blob([buf], { type: 'application/octet-stream' }), file.name || 'log.ulg');
+  fd.set('description', String(form.get('description') || 'via AI 测试工具工作台'));
+  fd.set('feedback', '');
+  fd.set('email', '');           /* 留空即可，不必收集用户邮箱 */
+  fd.set('type', 'private');     /* 分享链接模式，不进公开库 */
+  fd.set('public', 'false');
+  fd.set('redirect', 'true');    /* ★ 不发邮件，直接 302 回 plot_app，我们从回跳里取 id */
+
+  let up;
+  try {
+    up = await fetch(PX4_FR_UPLOAD, { method: 'POST', body: fd, redirect: 'manual' });
+  } catch (e) {
+    return json({ ok: false, error: '连不上 PX4 Flight Review：' + (e && e.message ? e.message : e) }, 502);
+  }
+
+  /* redirect: 'manual' 在 Deno 上返回 3xx 且带 Location */
+  const loc = up.headers.get('location') || '';
+  const m = loc.match(/[?&]log=([0-9a-f-]{36})/i);
+  if (!m) {
+    const txt = await up.text().catch(() => '');
+    return json({ ok: false, error: 'PX4 没返回 log id（HTTP ' + up.status + '）',
+      detail: txt.slice(0, 300) }, 502);
+  }
+  return json({
+    ok: true,
+    logId: m[1],
+    url: 'https://logs.px4.io/plot_app?log=' + m[1],
+    sizeMB: Math.round(file.size / 1048576 * 100) / 100
+  });
+}
+
 /* ---------- 大模型 API 代理（★ API Key 只存在服务端）---------- */
 async function handleProxy(req, env) {
   /* Cookie 现在允许跨站带了，所以每个会改状态/动用额度的接口都要先验来源 */
@@ -930,9 +1150,26 @@ async function handleProxy(req, env) {
     body: JSON.stringify(payload)
   };
 
+  const bucket = usageBucket(s);
+
   if (stream) {
-    /* 流式：原样把上游响应体转回去，浏览器端代码不用改逻辑 */
+    /* 流式：原样把上游响应体转回去，浏览器端代码不用改逻辑。
+       ★ 用 tee() 分一支出来扫 usage：累加 token 用量是旁路，
+         绝不能为了计量去动往浏览器送的那一支的字节。 */
     const up = await fetch(target, init);
+    if (up.body && up.ok) {
+      const [toClient, toMeter] = up.body.tee();
+      /* 不 await：让计量在后台跑，不给主响应加延迟 */
+      scanStreamUsage(toMeter, env, bucket);
+      return new Response(toClient, {
+        status: up.status,
+        headers: {
+          'Content-Type': up.headers.get('Content-Type') || 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          ...withCors(req, env)
+        }
+      });
+    }
     return new Response(up.body, {
       status: up.status,
       headers: {
@@ -945,6 +1182,13 @@ async function handleProxy(req, env) {
 
   const up = await fetch(target, init);
   const txt = await up.text();
+  /* 非流式：响应体本来就要整段读，直接从 JSON 里取 usage */
+  if (up.ok) {
+    try {
+      const j = JSON.parse(txt);
+      if (j && j.usage) addUsage(env, bucket, j.usage);
+    } catch (_) { /* 不是 JSON 就没用量可记 */ }
+  }
   return new Response(txt, {
     status: up.status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', ...withCors(req, env) }
@@ -984,11 +1228,14 @@ async function route(req, env) {
     if (p === '/api/guest')   return withJson(await handleGuest(req, env), req, env);
     if (p === '/api/logout')  return withJson(await handleLogout(req, env), req, env);
     if (p === '/api/session') return withJson(await handleSession(req, env), req, env);
+    /* 在线心跳：工作台定时打，只为刷新 lastSeen，不返回业务数据 */
+    if (p === '/api/ping') return withJson(await handlePing(req, env), req, env);
     if (p === '/api/bootstrap') return withJson(await handleBootstrap(req, env), req, env);
     /* ★ 必须 await。写成 `return handleProxy(...)` 的话，Promise 会直接逃出
        上面那个 try/catch —— handleProxy 里任何异步异常（上游网络错误之类）
        都会变成未捕获的 Promise 拒绝，而不是我们准备好��� 500 JSON。 */
     if (p === '/api/proxy')   return await handleProxy(req, env);
+    if (p === '/api/px4/upload') return withJson(await handlePx4Upload(req, env), req, env);
     if (p === '/api/admin/users') return withJson(await handleAdminUsers(req, env, p), req, env);
     if (p.startsWith('/api/admin/users/')) {
       return withJson(await handleAdminUsers(req, env, p), req, env);
