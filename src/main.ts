@@ -1,14 +1,9 @@
 /* =====================================================================
- * Deno Deploy 构建入口（默认路径）
+ * Deno Deploy 构建入口
  * ---------------------------------------------------------------------
- * 平台构建器默认找 <仓库根>/src/main.ts。
- * 根目录另有一个 main.ts，两种路径都能命中。
- *
- * 服务端配置（SESSION_SECRET / MODEL_API_KEY / ALLOW_ORIGINS）优先读
- * Deno 环境变量，读不到就回落到 KV 里的 config:server
- * ——那是 /api/bootstrap 一次性写入的，写完该接口永久关闭。
- *
- * 部署完成后打 /api/health 应看到：
- *   configured: true, configSource: "kv", hasSecret: true, hasModelKey: true
+ * 平台构建器找的是 <app 根>/src/main.ts，控制台 Runtime Configuration 里
+ * 的 Entrypoint 默认值却是 main.ts —— 两者不一致。
+ * 这里按构建器的路径来，根目录另有一个 main.ts 作为双保险。
+ * 真正的逻辑在 ../deno/main.js（读环境变量、连 KV、起服务）。
  * ===================================================================== */
 import '../deno/main.js';
