@@ -46,6 +46,14 @@ const kSess = (jti) => `sess:${jti}`;
 const kIp = (ip) => `ip:${encodeURIComponent(ip || 'unknown')}`;
 const kUid = (n) => `uid:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const kLock = (ip) => `lock:${encodeURIComponent(ip)}`;
+/* ---------- 更新通知的已读位置 ----------
+   ★ 为什么必须存服务端：localStorage 是**这台电脑**的。
+     换个浏览器、清一次缓存、或者换个 IP 从别处登录，红点就全量回来 ——
+     而需求是「已读跟着账号走，只有发了新消息才算未读」。
+     存本机等于把这个需求实现成了「已读跟着这台机器走」。
+   值 { seen: "<通知 id>", at }；只存「读到哪一条」，未读条数由前端按数组下标算，
+   这样加通知、删通知都不用动服务端。 */
+const kSeen = (n) => `seen:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 /* ★ 被强制下线的 IP：拉黑名单，冷却期内该 IP 登不进来。
    key 是 kick:<ip>，值 { ip, at, until, by, name }，用 TTL 自然过期。
    ★ 只有拿得到真实 IP 时才写这条：Deno Deploy 不下发客户端 IP，所有人
@@ -508,6 +516,34 @@ async function handleSession(req, env) {
    工作台每 5 分钟（仅在页面可见时）打一次这个接口刷新 lastSeen，
    管理台按「多久没心跳」判定在线与否。
    成本：一次 KV 写 + 一个 204，空响应；60 秒内重复调用直接跳过写入。 */
+/* ---------- 更新通知的已读位置 ----------
+   GET  → 这个账号读到哪一条了
+   POST → 标记已读（body { id }）
+   ★ 游客不落盘：所有游客共用一个账号名，写进去就等于所有人的已读互相污染。
+     这种情况返回 persisted:false，前端退回本机 localStorage —— 游客本来就是
+     「用完就走」，已读不跟着走是合理的。 */
+async function handleNotifySeen(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const s = await getSession(req, env);
+  if (!s) return json({ ok: false, error: 'no_session' }, 401);
+  if (Date.now() > s.expAt) return json({ ok: false, error: 'expired' }, 401);
+
+  if (s.guest) return json({ ok: true, seen: '', persisted: false });
+
+  const key = kSeen(s.name);
+  if (req.method === 'POST') {
+    let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+    /* id 只是「读到哪一条」的标记，不是自由文本，但仍然限长 + 去掉控制字符：
+       它要拼进 KV 值的 JSON，存太长或带怪字符会让排查变得很痛苦。 */
+    const id = String(b.id == null ? '' : b.id).replace(/[\x00-\x1F]/g, '').slice(0, 40);
+    await env.KV.put(key, JSON.stringify({ seen: id, at: Date.now() }));
+    return json({ ok: true, seen: id, persisted: true });
+  }
+  const rec = (await env.KV.get(key, 'json')) || {};
+  return json({ ok: true, seen: String(rec.seen || ''), persisted: true });
+}
+
 async function handlePing(req, env) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
@@ -630,6 +666,10 @@ async function handleAdminUsers(req, env, path) {
       users.push({
         id: u.id, name: u.name, role: u.role, enabled: !!u.enabled,
         createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null,
+        /* updAt = 最后一次**任意**修改；pwdAt = 最后一次改密码。
+           两者都带上，否则管理台问「密码什么时候改的」只能回答「不知道」——
+           那正是之前没记录、也没暴露造成的。 */
+        updAt: u.updAt || null, pwdAt: u.pwdAt || null,
         usage: { total: us.total || 0, prompt: us.prompt || 0, completion: us.completion || 0,
           calls: us.calls || 0, at: us.at || null }
       });
@@ -703,6 +743,11 @@ async function handleAdminUsers(req, env, path) {
       if (String(b.pwd).length < 6) return fail('密码至少 6 位');
       const { hash, salt } = await hashPassword(String(b.pwd), null, env);
       u.pwd = hash; u.salt = salt;
+      /* ★ 密码单独打点。之前只有 updAt，而它在下一行是**任何**修改都写的
+         （改角色、停用账号都会刷），所以「密码是什么时候改的」根本查不出来 ——
+         这是被用户直接问到、查了半天发现没记的。现在从这条起有据可查，
+         过去的记录补不回来。 */
+      u.pwdAt = Date.now();
       revoke = true;                        /* 改密码 = 旧会话全部作废 */
     }
     u.updAt = Date.now();
@@ -1246,6 +1291,9 @@ async function route(req, env) {
     if (p === '/api/guest')   return withJson(await handleGuest(req, env), req, env);
     if (p === '/api/logout')  return withJson(await handleLogout(req, env), req, env);
     if (p === '/api/session') return withJson(await handleSession(req, env), req, env);
+    /* 更新通知的已读位置：跟着**账号**走，存在服务端 KV（见 kSeen 的说明）。
+       缺了它，已读就只存在于「这台电脑」，换个浏览器/清缓存/换 IP 全量回红点。 */
+    if (p === '/api/notify/seen') return withJson(await handleNotifySeen(req, env), req, env);
     /* 在线心跳：工作台定时打，只为刷新 lastSeen，不返回业务数据 */
     if (p === '/api/ping') return withJson(await handlePing(req, env), req, env);
     if (p === '/api/bootstrap') return withJson(await handleBootstrap(req, env), req, env);
