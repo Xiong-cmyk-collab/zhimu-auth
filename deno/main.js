@@ -153,7 +153,11 @@ const env = {
   SESSION_SECRET: secret.value,
   MODEL_API: Deno.env.get('MODEL_API') || kvConfig.modelApi
     || 'https://api.minimax.chat/v1/text/chatcompletion_v2',
-  MODEL_NAME: Deno.env.get('MODEL_NAME') || kvConfig.modelName || 'MiniMax-M3',
+  /* ★ 默认模型 2026-10-20 从 MiniMax-M3 换成 MiniMax-M3.1-Flash（正式版）。
+     前端每次请求都会带 model，所以这个只是**兜底**（前端没带时的默认值）——
+     但兜底值本身就是「旧模型名」的另一个藏身处，只改前端不改这里，
+     就会出现「有的请求用新模型、有的请求还在打已经下架的旧模型」。 */
+  MODEL_NAME: Deno.env.get('MODEL_NAME') || kvConfig.modelName || 'MiniMax-M3.1-Flash',
   MODEL_API_KEY: modelKey.value,
   ALLOW_ORIGINS: origins.value,
   PBKDF2_ITER: Deno.env.get('PBKDF2_ITER') || '',
@@ -187,7 +191,7 @@ async function ensureConfig() {
   env.MODEL_API_KEY = env.MODEL_API_KEY || c.modelApiKey || '';
   env.ALLOW_ORIGINS = env.ALLOW_ORIGINS || c.allowOrigins || '';
   env.MODEL_API = env.MODEL_API || c.modelApi || 'https://api.minimax.chat/v1/text/chatcompletion_v2';
-  env.MODEL_NAME = env.MODEL_NAME || c.modelName || 'MiniMax-M3';
+  env.MODEL_NAME = env.MODEL_NAME || c.modelName || 'MiniMax-M3.1-Flash';
   env.CONFIG_SOURCE = 'kv';
   console.log('✅ 已从 KV 补齐配置');
 }
