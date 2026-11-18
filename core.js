@@ -608,7 +608,8 @@ const qIp = (ip) => `q:ip:${encodeURIComponent(ip || 'unknown')}`;
 const qUid = (n) => `q:uid:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const qState = (n) => `q:state:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const qLock = (ip) => `q:lock:${encodeURIComponent(ip)}`;
-const Q_REGISTER_PER_HOUR = 5;
+const Q_REGISTER_PER_HOUR = 30;   /* 原为 5：公司共用出口 IP 时，
+                                  一次培训会大家同时注册会被卡住 */
 const Q_ONLINE_WINDOW_MIN = 5;
 
 function qSetCookie(tk, maxAge) {
