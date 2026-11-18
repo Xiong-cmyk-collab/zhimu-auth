@@ -108,14 +108,27 @@ const json = (obj, status = 200, extra = {}) =>
 
 const fail = (msg, status = 400) => json({ ok: false, error: msg }, status);
 
-/** 客户端 IP。各平台塞的请求头不一样，全都要认。 */
+/* ★ 客户端 IP。各平台塞的请求头不一样，全都要认。
+   ⚠ 2026-11-18 实测：Deno Deploy 这边**一个 IP 请求头都不给**
+   （cf-connecting-ip / dpc-connecting-ip / x-forwarded-for 全是空），
+   老实现于是永远返回 'unknown' —— 全站共用一个 q:ip:unknown 键，
+   「同一 IP 免密」就变成了「谁后登录谁覆盖」，等于没有。
+   现在多认几个头，并做形状校验（不像 IP 的值直接丢掉，别把 'for=1.2.3.4'
+   这种 RFC 7239 写法或 'unknown' 当成 IP）。 */
+const IP_HEADERS = ['cf-connecting-ip', 'dpc-connecting-ip', 'x-forwarded-for',
+  'x-real-ip', 'true-client-ip', 'x-client-ip', 'x-forwarded'];
+function looksLikeIp(v) {
+  if (!v) return false;
+  if (/^(unknown|null|undefined|off|none)$/i.test(v)) return false;
+  return /^[0-9a-f:.]{3,45}$/i.test(v);
+}
 function clientIp(req) {
-  const cf = req.headers.get('cf-connecting-ip');
-  if (cf) return cf;
-  const dpc = req.headers.get('dpc-connecting-ip');
-  if (dpc) return dpc;
-  const xff = req.headers.get('x-forwarded-for');
-  if (xff) return xff.split(',')[0].trim();
+  for (const n of IP_HEADERS) {
+    const raw = req.headers.get(n);
+    if (!raw) continue;
+    const first = String(raw).split(',')[0].trim();
+    if (looksLikeIp(first)) return first;
+  }
   return 'unknown';
 }
 
@@ -605,6 +618,10 @@ const qUser = (id) => `q:user:${id}`;
 const qName = (n) => `q:name:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const qSess = (jti) => `q:sess:${jti}`;
 const qIp = (ip) => `q:ip:${encodeURIComponent(ip || 'unknown')}`;
+/* ★ 按**设备**记的免密记录（客户端 localStorage 里的随机 qdid）。
+   为什么不能只靠 IP：手机走 4G/5G，运营商 CGNAT 的出口 IP 经常变；
+   而 Deno Deploy 干脆连 IP 都给不出来。所以免密改成认「这台设备」。 */
+const qDev = (did) => `q:dev:${encodeURIComponent(String(did || '').slice(0, 64))}`;
 const qUid = (n) => `q:uid:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const qState = (n) => `q:state:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 /* ★ 锁按「IP + 账号」计，不再按 IP 一把大锁。
@@ -626,8 +643,10 @@ function qSetCookie(tk, maxAge) {
 }
 
 /** 答题站会话：只认 s==='quiz' 的令牌，读写都用 q: 前缀的键 */
-async function getQuizSession(req, env) {
-  const tk = readCookie(req, 'qztk') || (req.headers.get('X-QZ-Token') || '');
+async function getQuizSession(req, env, tokenOverride) {
+  /* tokenOverride：会话检查走 POST + form body 时，令牌放在 body 里传过来
+     （这样是**简单请求**，浏览器不预检，手机慢网下不会超时）。 */
+  const tk = tokenOverride || readCookie(req, 'qztk') || (req.headers.get('X-QZ-Token') || '');
   if (!tk) return null;
   const p = await verifyToken(tk, env.SESSION_SECRET);
   if (!p || p.s !== 'quiz') return null;          /* ★ 站点标记：工作台的令牌这里不认 */
@@ -637,10 +656,15 @@ async function getQuizSession(req, env) {
     ip: p.i || 'unknown', guest: false, expAt: p.e, loginAt: p.a, lastSeen: Date.now()
   };
   const cur = await env.KV.get(qUid(p.n), 'json');
-  if (cur && (cur.iat || 0) > (p.a || 0)) {
-    if (cur.jti !== p.j) return null;
+  if (cur) {
+    /* 被封禁 / 被删号 → 立刻失效 */
     if (cur.enabled === false) return null;
     if (cur.role) s.role = cur.role;
+    /* ★ 不再因为「别处又登录了一次」就把当前会话作废。
+       原来这里判 cur.iat > p.a 且 jti 不同就 return null，等于
+       「同一账号同时只能在一处登录」—— 手机和电脑互相踢，
+       用户要的「7 天不用再输密码」根本落不了地。
+       改密码 / 删号 / 封禁 依然立刻踢掉（见 admin users PUT/DELETE 与 qPurgeSessions）。 */
   }
   return s;
 }
@@ -654,7 +678,7 @@ async function isQuizAdmin(req, env) {
   return u && u.enabled && u.role === 'admin' ? u : null;
 }
 
-async function qIssueSession(env, u, req) {
+async function qIssueSession(env, u, req, did) {
   const ip = clientIp(req);
   const ua = String(req.headers.get('User-Agent') || '').slice(0, 200);
   const jti = token();
@@ -668,7 +692,7 @@ async function qIssueSession(env, u, req) {
     loginAt: issuedAt, lastSeen: issuedAt, expAt
   }), { expirationTtl: TTL_SESSION });
   await env.KV.put(qUid(u.name), JSON.stringify({
-    ip, token: tk, jti, iat: issuedAt, role: u.role, enabled: true
+    ip, token: tk, jti, iat: issuedAt, role: u.role, enabled: u.enabled !== false
   }), { expirationTtl: TTL_SESSION });
   const ipRec = await env.KV.get(qIp(ip), 'json');
   await env.KV.put(qIp(ip), JSON.stringify({
@@ -677,6 +701,13 @@ async function qIssueSession(env, u, req) {
     keep: u.keep !== false,
     lastGuestAt: (ipRec || {}).lastGuestAt || 0
   }), { expirationTtl: TTL_SESSION });
+  /* ★ 按设备记一份（免密的主路径）：换 IP、换网络都不影响。
+     did 是客户端 localStorage 里的随机串，不是密码也不是隐私。 */
+  if (u.keep !== false && did) {
+    await env.KV.put(qDev(did), JSON.stringify({
+      name: u.name, token: tk, jti, at: issuedAt
+    }), { expirationTtl: TTL_SESSION });
+  }
   return { token: tk, expireAt: expAt };
 }
 
@@ -736,7 +767,8 @@ async function handleQRegister(req, env) {
   await env.KV.put(qName(name), JSON.stringify(id));
   await env.KV.put(regKey, String(cnt + 1), { expirationTtl: 3600 });
 
-  const sess = await qIssueSession(env, Object.assign({}, u, { keep: b.keep !== false }), req);
+  const sess = await qIssueSession(env, Object.assign({}, u, { keep: parseKeep(b.keep) }),
+    req, String(b.did || '').slice(0, 64));
   return json({
     ok: true, user: { name: u.name, role: u.role },
     token: sess.token, expireAt: sess.expireAt
@@ -763,6 +795,32 @@ async function bumpQFail(env, lockKey, lockIpKey) {
   } catch (e) { /* 计数坏了也不能挡住登录 */ }
 }
 
+/* ---------- 答题站：免密复用（按设备优先，其次按 IP） ---------- */
+/* 前端传的是字符串 '1' / '0'，JS 里 '0' 是**真值** ——
+   `b.keep !== false` 恒为 true，勾不勾「保持登录」都按保持处理。 */
+function parseKeep(v) {
+  if (v === undefined || v === null || v === '') return true;
+  const s = String(v).trim().toLowerCase();
+  return !(s === '0' || s === 'false' || s === 'no' || s === 'off');
+}
+
+/* 复用会话：**只认这台设备**（q:dev:<did>）。
+   ★ 为什么不能按 IP：Deno Deploy 给不出真实 IP，clientIp() 恒为 'unknown'
+     → 全站共用一个 q:ip:unknown 键 → 「同 IP 免密」等于
+     **任何人只要知道账号名、密码留空，就能登进别人的账号**。
+     IP 记录还留着，但只给管理后台显示「谁在线」，不再参与登录授权。
+   复用前要真正验签 + 确认会话记录还在，不能只看指针。 */
+async function qReuseSession(env, name, did) {
+  if (!did) return null;
+  const rec = await env.KV.get(qDev(did), 'json');
+  if (!rec || !rec.token || rec.name !== name) return null;
+  const pv = await verifyToken(rec.token, env.SESSION_SECRET);
+  if (!pv || pv.g || pv.n !== name || !pv.e || Date.now() > pv.e) return null;
+  const sess = await env.KV.get(qSess(rec.jti), 'json');
+  if (!sess || sess.jti !== rec.jti) return null;   /* 会话已被登出/改密清掉 */
+  return { token: rec.token, user: pubUser(pv.n, pv.r), expireAt: pv.e };
+}
+
 /* ---------- 答题站：登录 / 会话 / 登出 ---------- */
 async function handleQLogin(req, env) {
   const bad = assertSameOrigin(req, env);
@@ -772,9 +830,11 @@ async function handleQLogin(req, env) {
   try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
   const name = String(b.name || '').trim();
   const pwd = String(b.pwd || '');
-  /* keep=true 时密码可以留空：同 IP 同账号的会话还活着就直接进（7 天内免密） */
+  const did = String(b.did || '').slice(0, 64);
+  const keepOn = parseKeep(b.keep);
+  /* keep=true 时密码可以留空：同一台设备（或同一 IP）的会话还活着就直接进（7 天内免密） */
   if (!name) return fail('请填写账号');
-  if (!pwd && !b.keep) return fail('请填写账号与密码');
+  if (!pwd && !keepOn) return fail('请填写账号与密码');
 
   /* 暴力破解限速：同 IP 同一账号连错 5 次 → 只锁这个账号 10 分钟；
      同 IP 跨账号连错 30 次 → 锁这个 IP 30 分钟（防批量撞库）。
@@ -791,24 +851,20 @@ async function handleQLogin(req, env) {
     return fail('本机 IP 尝试次数过多，请 ' + Math.ceil((lockIp - Date.now()) / 60000) + ' 分钟后再试', 429);
   }
 
-  /* ★ 「同一 IP 保持登录」：同 IP + 同账号 + 会话还有效 → 直接复用，不再校验密码。
-     免得换个浏览器 / 清了 Cookie 还得重新输一遍（用户 2026-11-18 明确要求：
-     同一个账号在同一个 IP 下，7 天有效期不用再次输入）。 */
-  if (b.keep) {
-    const ipRec = await env.KV.get(qIp(ip), 'json');
-    if (ipRec && ipRec.token && !ipRec.guest && ipRec.name === name && ipRec.keep !== false) {
-      const pv = await verifyToken(ipRec.token, env.SESSION_SECRET);
-      const ptr = pv ? await env.KV.get(qUid(name), 'json') : null;
-      /* 指针缺失也算失效：宁可重新签一个，也别递一条已经作废的令牌 */
-      const alive = pv && !pv.g && pv.n === name && Date.now() < pv.e
-        && ptr && ptr.jti === pv.j && ptr.token === ipRec.token && ptr.token;
-      if (alive) {
-        return json({
-          ok: true, reused: true, user: pubUser(pv.n, pv.r),
-          token: ipRec.token, expireAt: pv.e, guest: false
-        }, 200, { 'Set-Cookie': qSetCookie(ipRec.token, TTL_SESSION) });
-      }
+  /* ★ 「保持登录」：密码留空时直接复用本设备/本 IP 上还活着的会话。
+     ★ 只在**密码留空**时复用 —— 填了密码就老老实实验密码，
+       不然「密码写错了也照样登进去」是很糟糕的行为。
+     主路径是**按设备**（q:dev）：手机换网络、换 IP 都不影响；
+     同 IP 只是补充（旧数据兼容）。 */
+  if (keepOn && !pwd) {
+    const reuse = await qReuseSession(env, name, did);
+    if (reuse) {
+      return json({
+        ok: true, reused: true, user: reuse.user,
+        token: reuse.token, expireAt: reuse.expireAt, guest: false
+      }, 200, { 'Set-Cookie': qSetCookie(reuse.token, TTL_SESSION) });
     }
+    return fail('本机没有可复用的登录记录，请输入密码', 401);
   }
 
   const id = await env.KV.get(qName(name), 'json');
@@ -830,7 +886,7 @@ async function handleQLogin(req, env) {
   user.lastLoginAt = Date.now();
   await env.KV.put(qUser(id), JSON.stringify(user));
 
-  const sess = await qIssueSession(env, Object.assign({}, user, { keep: b.keep !== false }), req);
+  const sess = await qIssueSession(env, Object.assign({}, user, { keep: keepOn }), req, did);
   return json({
     ok: true, user: { name: user.name, role: user.role },
     token: sess.token, expireAt: sess.expireAt
@@ -838,13 +894,25 @@ async function handleQLogin(req, env) {
 }
 
 async function handleQSession(req, env) {
-  const s = await getQuizSession(req, env);
+  /* ★ 支持 POST + form-urlencoded：令牌放 body 里传过来。
+     这样前端发的是**简单请求**，浏览器不发 CORS 预检 —— 手机慢网下
+     「GET + X-QZ-Token 头」会被预检拖超时，表现就是每次都要重新登录。 */
+  let tk = '';
+  if (req.method === 'POST') {
+    let b = {};
+    try { b = await qReadBody(req); } catch (e) { b = {}; }
+    tk = String(b.tk || '').slice(0, 4000);
+  }
+  const s = await getQuizSession(req, env, tk);
   if (!s) return json({ ok: false, error: 'no_session' }, 401);
   return json({ ok: true, user: { name: s.name, role: s.role }, expireAt: s.expAt });
 }
 
 async function handleQLogout(req, env) {
+  let did = '';
+  try { const b = await qReadBody(req); did = String(b.did || '').slice(0, 64); } catch (e) {}
   const s = await getQuizSession(req, env);
+  if (did) await env.KV.delete(qDev(did));
   if (s) {
     await env.KV.delete(qSess(s.jti));
     const cur = await env.KV.get(qUid(s.name), 'json');
@@ -855,6 +923,28 @@ async function handleQLogout(req, env) {
     }
   }
   return json({ ok: true }, 200, { 'Set-Cookie': qSetCookie('', 0) });
+}
+
+/* ---------- 诊断：服务端看到的「我是谁 / 我带了什么」 ---------- */
+/* 只回显**请求方自己**的请求信息（IP、UA、有没有带 Cookie/令牌），
+   不含任何他人数据。用来一次性搞清楚「Deno Deploy 到底给不给真实 IP」，
+   以及手机上「保持登录」到底卡在哪一环。 */
+async function handleQWhereami(req, env) {
+  const seen = {};
+  for (const n of IP_HEADERS) {
+    const v = req.headers.get(n);
+    if (v) seen[n] = String(v).slice(0, 120);
+  }
+  return json({
+    ok: true,
+    ip: clientIp(req),
+    ipHeaders: seen,
+    ua: String(req.headers.get('User-Agent') || '').slice(0, 140),
+    hasCookie: !!readCookie(req, 'qztk'),
+    hasTokenHeader: !!req.headers.get('X-QZ-Token'),
+    hasDevId: !!(req.headers.get('X-QZ-Dev') || ''),
+    serverTime: Date.now()
+  });
 }
 
 /* ---------- 答题站：答题状态（错题本 / 进度 / 成绩） ---------- */
@@ -920,8 +1010,16 @@ function sanitizeQuizState(st) {
 async function handleQQuizState(req, env) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
-  const s = await getQuizSession(req, env);
-  if (!s) return json({ ok: false, error: 'no_session' }, 401);
+  /* ★ POST 时令牌放在 body 里（form-urlencoded）→ 简单请求，浏览器不预检。
+     原来只有 GET 可用，GET + 自定义头会触发 CORS 预检，手机慢网下超时，
+     结果是错题本同步不上去。 */
+  let tk = '', b = null;
+  if (req.method === 'POST') {
+    try { b = await qReadBody(req); } catch (e) { b = null; }
+    if (b) tk = String(b.tk || '').slice(0, 4000);
+  }
+  const s = await getQuizSession(req, env, tk);
+  if (!s) return fail('登录已失效，请重新登录', 401);
 
   const key = qState(s.name);
   if (req.method === 'GET') {
@@ -929,9 +1027,17 @@ async function handleQQuizState(req, env) {
     return json({ ok: true, state: (rec && rec.state) ? rec.state : null });
   }
   if (req.method === 'POST') {
-    let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
-    if (!b || !b.state || typeof b.state !== 'object') return fail('缺少 state');
-    const clean = sanitizeQuizState(b.state);
+    if (!b) return fail('请求体不是合法 JSON');
+    /* op=load：只读（前端用 POST + form 传令牌，免 CORS 预检） */
+    if (b.op === 'load') {
+      const rec = await env.KV.get(key, 'json');
+      return json({ ok: true, state: (rec && rec.state) ? rec.state : null });
+    }
+    /* form 传过来的 state 是 JSON 字符串，要解一次 */
+    let st = b.state;
+    if (typeof st === 'string') { try { st = JSON.parse(st); } catch (e) { st = null; } }
+    if (!st || typeof st !== 'object') return fail('缺少 state');
+    const clean = sanitizeQuizState(st);
     await env.KV.put(key, JSON.stringify({ state: clean, name: s.name, at: Date.now() }));
     return json({ ok: true, saved: true });
   }
@@ -1117,7 +1223,14 @@ async function handleQAdminUsers(req, env, path) {
 async function handleQPing(req, env) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
-  const s = await getQuizSession(req, env);
+  /* POST + form body 传令牌 → 简单请求，不预检 */
+  let tk = '';
+  if (req.method === 'POST') {
+    let b = {};
+    try { b = await qReadBody(req); } catch (e) { b = {}; }
+    tk = String(b.tk || '').slice(0, 4000);
+  }
+  const s = await getQuizSession(req, env, tk);
   if (!s) return json({ ok: false, error: 'no_session' }, 401);
 
   const now = Date.now();
@@ -2028,6 +2141,7 @@ async function route(req, env) {
     if (p === '/api/q/register') return withJson(await handleQRegister(req, env), req, env);
     if (p === '/api/q/login')    return withJson(await handleQLogin(req, env), req, env);
     if (p === '/api/q/session')  return withJson(await handleQSession(req, env), req, env);
+    if (p === '/api/q/whereami') return withJson(await handleQWhereami(req, env), req, env);
     if (p === '/api/q/ping')     return withJson(await handleQPing(req, env), req, env);
     if (p === '/api/q/logout')   return withJson(await handleQLogout(req, env), req, env);
     if (p === '/api/q/quiz/state') return withJson(await handleQQuizState(req, env), req, env);
