@@ -1820,7 +1820,7 @@ async function route(req, env) {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: withCors(req, env, {
       'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,X-ZT-Token'
+      'Access-Control-Allow-Headers': 'Content-Type,X-ZT-Token,X-QZ-Token'
     }) });
   }
 
