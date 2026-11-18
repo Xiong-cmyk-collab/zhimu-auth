@@ -703,10 +703,16 @@ async function qIssueSession(env, u, req, did) {
   }), { expirationTtl: TTL_SESSION });
   /* ★ 按设备记一份（免密的主路径）：换 IP、换网络都不影响。
      did 是客户端 localStorage 里的随机串，不是密码也不是隐私。 */
-  if (u.keep !== false && did) {
-    await env.KV.put(qDev(did), JSON.stringify({
-      name: u.name, token: tk, jti, at: issuedAt
-    }), { expirationTtl: TTL_SESSION });
+  if (did) {
+    if (u.keep !== false) {
+      await env.KV.put(qDev(did), JSON.stringify({
+        name: u.name, token: tk, jti, at: issuedAt
+      }), { expirationTtl: TTL_SESSION });
+    } else {
+      /* ★ 用户把「保持登录」关了 → 本机的免密记录必须一起清掉。
+         不清的话会出现「明明取消了，下次密码留空还是能进」的诡异行为。 */
+      await env.KV.delete(qDev(did));
+    }
   }
   return { token: tk, expireAt: expAt };
 }
@@ -989,11 +995,21 @@ function sanitizeQuizState(st) {
   if (Array.isArray(st.exams)) {
     for (const e of st.exams.slice(-MAX_QUIZ_EXAMS)) {
       if (!e || typeof e !== 'object') continue;
+      /* boardName：板块**名字**（后台直接显示「V6X 飞控控制器」，不用拿 id 去猜）
+         wrongPicks：错题对应的「他选了第几项」—— 后台要能看出
+                     「他选 B，正确答案是 C」，不能只知道这题错了 */
+      const wp = {};
+      if (e.wrongPicks && typeof e.wrongPicks === 'object') {
+        for (const wk of Object.keys(e.wrongPicks).slice(0, 500)) {
+          wp[str(wk, 64)] = Math.max(0, Math.min(3, Number(e.wrongPicks[wk]) || 0));
+        }
+      }
       out.exams.push({
-        at: Number(e.at) || 0, board: str(e.board, 40),
+        at: Number(e.at) || 0, board: str(e.board, 40), boardName: str(e.boardName, 60),
         score: Math.max(0, Number(e.score) || 0), total: Math.max(0, Number(e.total) || 0),
         usedMs: Math.max(0, Number(e.usedMs) || 0),
-        wrongIds: Array.isArray(e.wrongIds) ? e.wrongIds.slice(0, 500).map(x => str(x, 64)) : []
+        wrongIds: Array.isArray(e.wrongIds) ? e.wrongIds.slice(0, 500).map(x => str(x, 64)) : [],
+        wrongPicks: wp
       });
     }
   }
@@ -1119,7 +1135,7 @@ async function handleQQuizExport(req, env) {
     for (const e of r.examList) {
       const row = base.slice();
       row[3] = fmtTime(e.at);
-      row[4] = e.board || '';
+      row[4] = e.boardName || e.board || '';   /* 板块名，不是 id */
       row[5] = e.score == null ? '' : e.score;
       row[6] = e.total == null ? '' : e.total;
       row[7] = e.total ? (Math.round(e.score * 100 / e.total) + '%') : '';
