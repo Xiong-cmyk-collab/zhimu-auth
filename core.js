@@ -1111,6 +1111,60 @@ async function handleQAdminSetup(req, env) {
   return json({ ok: true, created, updated, allowOrigins });
 }
 
+/* ---------- 一次性：拥有者移交（仅拥有者会话） ----------
+   背景：那次误操作临时建了 ZM1 当拥有者，而系统接口既不许降级拥有者、
+   也不许转移拥有者（错误信息原文就是「想移交请直接改数据库」）。
+   这个接口在服务端直接改 KV 完成移交，**做完一次就永久关闭**。
+   用法：POST { to: '目标账号名', remove: ['要删掉的账号名', ...] } */
+async function handleOwnerTransfer(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  if (req.method !== 'POST') return fail('仅支持 POST', 405);
+
+  const done = await env.KV.get('ops:owner_transfer', 'json');
+  if (done) return fail('拥有者移交已完成，接口已关闭', 409);
+
+  const admin = await isAdmin(req, env);
+  if (!admin || !isOwner(admin)) return fail('需要拥有者权限', 403);
+
+  let b;
+  try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const to = String(b.to || '').trim();
+  const remove = Array.isArray(b.remove) ? b.remove.map(x => String(x || '').trim()).filter(Boolean) : [];
+  if (!to) return fail('缺少目标账号名');
+
+  const targetId = await env.KV.get(kName(to), 'json');
+  const target = targetId ? await env.KV.get(kUser(targetId), 'json') : null;
+  if (!target) return fail('目标账号不存在：' + to, 404);
+
+  const removed = [];
+  for (const nm of remove) {
+    if (nm === to) continue;
+    const id = await env.KV.get(kName(nm), 'json');
+    const u = id ? await env.KV.get(kUser(id), 'json') : null;
+    if (!u) continue;
+    await env.KV.delete(kUser(id));
+    await env.KV.delete(kName(nm));
+    await env.KV.delete(kUid(nm));
+    await purgeUserSessions(env, nm);
+    removed.push(nm);
+  }
+
+  target.role = 'owner';
+  target.enabled = true;
+  target.updAt = Date.now();
+  await env.KV.put(kUser(targetId), JSON.stringify(target));
+  /* 让目标账号的会话立刻带上新角色 */
+  const s = await env.KV.get(kUid(to), 'json');
+  if (s) {
+    s.role = 'owner';
+    await env.KV.put(kUid(to), JSON.stringify(s), { expirationTtl: TTL_SESSION });
+  }
+
+  await env.KV.put('ops:owner_transfer', JSON.stringify({ at: Date.now(), to, removed }));
+  return json({ ok: true, to, removed });
+}
+
 /* ---------- 管理后台 ---------- */
 async function isAdmin(req, env) {
   const s = await getSession(req, env);
@@ -1863,6 +1917,8 @@ async function route(req, env) {
     if (p === '/api/proxy')   return await handleProxy(req, env);
     if (p === '/api/px4/upload') return withJson(await handlePx4Upload(req, env), req, env);
     if (p === '/api/admin/users') return withJson(await handleAdminUsers(req, env, p), req, env);
+    /* 一次性：拥有者移交（善后用，做完自动关闭） */
+    if (p === '/api/admin/owner-transfer') return withJson(await handleOwnerTransfer(req, env), req, env);
     if (p.startsWith('/api/admin/users/')) {
       return withJson(await handleAdminUsers(req, env, p), req, env);
     }
