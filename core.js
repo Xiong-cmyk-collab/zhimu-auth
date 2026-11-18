@@ -119,9 +119,25 @@ function clientIp(req) {
   return 'unknown';
 }
 
+/* ---------- 登录限速的「桶」 ----------
+ * ★ 正常按 IP 分桶；拿不到真实 IP 时**不能**用 'unknown'：
+ *   Deno Deploy 不下发客户端 IP，所有人算出来都是 unknown，那是个全站共享桶 ——
+ *   一个人输错 5 次密码，全站所有人 10 分钟都登不进去
+ *   （2026-11-18 用户撞上了：登录页把 429 说成「网关不可用」，他以为平台坏了）。
+ * ⇒ 拿不到真实 IP 时改成「账号名 + 浏览器指纹」：
+ *   同一个账号在同一浏览器上输错 5 次照样锁（防手抖、防针对单账号的爆破），
+ *   但不会连累别的账号、也不会连累同一出口的同事。
+ * ★ 改了要重新部署网关才生效（deno deploy）。 */
+function lockScope(req, name) {
+  const ip = clientIp(req);
+  if (isRealIp(ip)) return 'ip:' + ip;
+  const ua = String(req.headers.get('User-Agent') || '').slice(0, 120);
+  const who = encodeURIComponent(String(name || '').trim().toLowerCase());
+  return 'acct:' + who + ':' + encodeURIComponent(ua);
+}
+
 /** 统一允许的来源：站点自己的域名 + 本地开发。
- *  没做白名单的话，任何人拿个网页都能拿你的 token 来调 —— 那登录就白做了。 */
-function corsOrigin(req, env) {
+ *  没做白名单的话，任何人拿个网页都能拿你的 token 来调 —— 那登录就白做了。 */function corsOrigin(req, env) {
   const origin = req.headers.get('Origin') || '';
   const allow = (env.ALLOW_ORIGINS || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
@@ -323,8 +339,17 @@ async function handleLogin(req, env) {
     }
   }
 
-  /* 暴力破解限速：同一 IP 连续失败 5 次锁 10 分钟 */
-  const lockKey = kLock(ip);
+  /* 暴力破解限速：同一 IP 连续失败 5 次锁 10 分钟
+     ★ 2026-11-18：桶不能是全站共享的 'unknown'。
+       Deno Deploy 不下发真实客户端 IP（cf-connecting-ip / dpc-connecting-ip /
+       x-forwarded-for 全都没有），所有人算出来都是 'unknown' —— 那是个**全站共享桶**：
+       一个人输错 5 次密码，**全站所有人 10 分钟都登不进去**
+       （用户当场撞上了：登录页又把 429 说成「网关不可用」，他以为平台坏了，越试越多）。
+       ⇒ 拿不到真实 IP 时，桶改成「账号名 + 浏览器指纹」：
+         同一个账号在同一浏览器上输错 5 次照样锁（防手抖、防针对单账号的爆破），
+         但不会连累别的账号、更不会连累同一出口的同事。
+       ★ 改完必须重新部署网关才生效（deno deploy），见文件末尾的说明。 */
+  const lockKey = kLock(lockScope(req, name));
   const lock = await env.KV.get(lockKey);
   if (lock && Date.now() < Number(lock)) {
     return fail('失败次数过多，请 ' + Math.ceil((lock - Date.now()) / 60000) + ' 分钟后再试', 429);
@@ -1001,6 +1026,34 @@ async function handleQAdminUsers(req, env, path) {
   }
 
   return fail('不支持的方法', 405);
+}
+
+/* ---------- 答题站：心跳（刷新 lastSeen） ----------
+   ★ 没有它，在线判定会「5 分钟后自动掉线」：
+     在线判定看 q:sess 记录的 lastSeen 是否在 Q_ONLINE_WINDOW_MIN 内，
+     而 lastSeen 只在登录那一刻写过一次 —— 之后没人刷新它。
+   工作台那边有 /api/ping 干这件事，答题站一开始漏了。 */
+async function handleQPing(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const s = await getQuizSession(req, env);
+  if (!s) return json({ ok: false, error: 'no_session' }, 401);
+
+  const now = Date.now();
+  const rec = await env.KV.get(qSess(s.jti), 'json');
+  if (!rec) {
+    /* 会话记录没了（比如 TTL 过期），补一条，免得刚登录就掉出在线列表 */
+    await env.KV.put(qSess(s.jti), JSON.stringify({
+      jti: s.jti, name: s.name, role: s.role, ip: s.ip, ua: '',
+      guest: false, loginAt: s.loginAt || now, lastSeen: now, expAt: s.expAt
+    }), { expirationTtl: TTL_SESSION });
+    return json({ ok: true, lastSeen: now, revived: true });
+  }
+  /* 60 秒内的重复心跳不重写，省掉无谓的 KV 写 */
+  if (now - (rec.lastSeen || 0) < 60000) return json({ ok: true, skipped: true });
+  rec.lastSeen = now;
+  await env.KV.put(qSess(s.jti), JSON.stringify(rec), { expirationTtl: TTL_SESSION });
+  return json({ ok: true, lastSeen: now });
 }
 
 /* ---------- 答题站：在线情况（管理员） ---------- */
@@ -1894,6 +1947,7 @@ async function route(req, env) {
     if (p === '/api/q/register') return withJson(await handleQRegister(req, env), req, env);
     if (p === '/api/q/login')    return withJson(await handleQLogin(req, env), req, env);
     if (p === '/api/q/session')  return withJson(await handleQSession(req, env), req, env);
+    if (p === '/api/q/ping')     return withJson(await handleQPing(req, env), req, env);
     if (p === '/api/q/logout')   return withJson(await handleQLogout(req, env), req, env);
     if (p === '/api/q/quiz/state') return withJson(await handleQQuizState(req, env), req, env);
     if (p === '/api/q/quiz/stats') return withJson(await handleQQuizStats(req, env), req, env);
