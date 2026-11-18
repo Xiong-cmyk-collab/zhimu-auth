@@ -673,6 +673,8 @@ async function qIssueSession(env, u, req) {
   const ipRec = await env.KV.get(qIp(ip), 'json');
   await env.KV.put(qIp(ip), JSON.stringify({
     token: tk, jti, name: u.name, guest: false,
+    /* keep=true 才记这个 —— 之后同 IP 同账号可以直接复用会话，免密进 */
+    keep: u.keep !== false,
     lastGuestAt: (ipRec || {}).lastGuestAt || 0
   }), { expirationTtl: TTL_SESSION });
   return { token: tk, expireAt: expAt };
@@ -718,7 +720,7 @@ async function handleQRegister(req, env) {
   await env.KV.put(qName(name), JSON.stringify(id));
   await env.KV.put(regKey, String(cnt + 1), { expirationTtl: 3600 });
 
-  const sess = await qIssueSession(env, u, req);
+  const sess = await qIssueSession(env, Object.assign({}, u, { keep: b.keep !== false }), req);
   return json({
     ok: true, user: { name: u.name, role: u.role },
     token: sess.token, expireAt: sess.expireAt
@@ -754,7 +756,9 @@ async function handleQLogin(req, env) {
   try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
   const name = String(b.name || '').trim();
   const pwd = String(b.pwd || '');
-  if (!name || !pwd) return fail('请填写账号与密码');
+  /* keep=true 时密码可以留空：同 IP 同账号的会话还活着就直接进（7 天内免密） */
+  if (!name) return fail('请填写账号');
+  if (!pwd && !b.keep) return fail('请填写账号与密码');
 
   /* 暴力破解限速：同 IP 同一账号连错 5 次 → 只锁这个账号 10 分钟；
      同 IP 跨账号连错 30 次 → 锁这个 IP 30 分钟（防批量撞库）。
@@ -771,10 +775,32 @@ async function handleQLogin(req, env) {
     return fail('本机 IP 尝试次数过多，请 ' + Math.ceil((lockIp - Date.now()) / 60000) + ' 分钟后再试', 429);
   }
 
+  /* ★ 「同一 IP 保持登录」：同 IP + 同账号 + 会话还有效 → 直接复用，不再校验密码。
+     免得换个浏览器 / 清了 Cookie 还得重新输一遍（用户 2026-11-18 明确要求：
+     同一个账号在同一个 IP 下，7 天有效期不用再次输入）。 */
+  if (b.keep) {
+    const ipRec = await env.KV.get(qIp(ip), 'json');
+    if (ipRec && ipRec.token && !ipRec.guest && ipRec.name === name && ipRec.keep !== false) {
+      const pv = await verifyToken(ipRec.token, env.SESSION_SECRET);
+      const ptr = pv ? await env.KV.get(qUid(name), 'json') : null;
+      /* 指针缺失也算失效：宁可重新签一个，也别递一条已经作废的令牌 */
+      const alive = pv && !pv.g && pv.n === name && Date.now() < pv.e
+        && ptr && ptr.jti === pv.j && ptr.token === ipRec.token && ptr.token;
+      if (alive) {
+        return json({
+          ok: true, reused: true, user: pubUser(pv.n, pv.r),
+          token: ipRec.token, expireAt: pv.e, guest: false
+        }, 200, { 'Set-Cookie': qSetCookie(ipRec.token, TTL_SESSION) });
+      }
+    }
+  }
+
   const id = await env.KV.get(qName(name), 'json');
   const user = id ? await env.KV.get(qUser(id), 'json') : null;
   if (!user || !user.enabled) {
-    await bumpFail(env, lockKey);
+    /* ⚠ 这里原来调的是工作台的 bumpFail（单键版），
+       答题站要用自己那套（账号级 + IP 级两把计数），否则计数会写错键。 */
+    await bumpQFail(env, lockKey, lockIpKey);
     return fail('账号或密码不正确', 401);
   }
   const { hash } = await hashPassword(pwd, user.salt, env);
@@ -788,7 +814,7 @@ async function handleQLogin(req, env) {
   user.lastLoginAt = Date.now();
   await env.KV.put(qUser(id), JSON.stringify(user));
 
-  const sess = await qIssueSession(env, user, req);
+  const sess = await qIssueSession(env, Object.assign({}, user, { keep: b.keep !== false }), req);
   return json({
     ok: true, user: { name: user.name, role: user.role },
     token: sess.token, expireAt: sess.expireAt
