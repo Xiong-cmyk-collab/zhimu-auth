@@ -688,13 +688,29 @@ async function qPurgeSessions(env, name) {
   }
 }
 
+/* ★ 读请求体：兼容 application/json 和 application/x-www-form-urlencoded。
+   为什么要兼容后者：POST 带 application/json 属于「非简单请求」，
+   浏览器必须先发一次 CORS 预检（OPTIONS），等于一次操作两个往返。
+   移动网络下实测登录就是这么超时失败的（网关本身要 2~3 秒，冷启动更久）。
+   改用 form-urlencoded 就是**简单请求**，不用预检 —— 直接一次往返。 */
+async function qReadBody(req) {
+  const ct = (req.headers.get('Content-Type') || '').toLowerCase();
+  if (ct.indexOf('application/x-www-form-urlencoded') >= 0) {
+    const form = await req.formData();
+    const o = {};
+    for (const [k, v] of form.entries()) o[k] = (typeof v === 'string') ? v : '';
+    return o;
+  }
+  return await req.json();
+}
+
 /* ---------- 答题站：公开注册 ---------- */
 async function handleQRegister(req, env) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
   if (req.method !== 'POST') return fail('仅支持 POST', 405);
   let b;
-  try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
 
   const name = String(b.name || '').trim();
   const pwd = String(b.pwd || '');
@@ -753,7 +769,7 @@ async function handleQLogin(req, env) {
   if (bad) return bad;
   if (req.method !== 'POST') return fail('仅支持 POST', 405);
   let b;
-  try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
   const name = String(b.name || '').trim();
   const pwd = String(b.pwd || '');
   /* keep=true 时密码可以留空：同 IP 同账号的会话还活着就直接进（7 天内免密） */
