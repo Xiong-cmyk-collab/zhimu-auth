@@ -359,7 +359,7 @@ async function handleLogin(req, env) {
   const user = id ? await env.KV.get(kUser(id), 'json') : null;
 
   if (!user || !user.enabled) {
-    await bumpFail(env, lockKey);
+    await bumpQFail(env, lockKey, lockIpKey);
     return fail('账号或密码不正确', 401);
   }
   const { hash } = await hashPassword(pwd, user.salt, env);
@@ -607,7 +607,16 @@ const qSess = (jti) => `q:sess:${jti}`;
 const qIp = (ip) => `q:ip:${encodeURIComponent(ip || 'unknown')}`;
 const qUid = (n) => `q:uid:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const qState = (n) => `q:state:${encodeURIComponent(String(n).trim().toLowerCase())}`;
-const qLock = (ip) => `q:lock:${encodeURIComponent(ip)}`;
+/* ★ 锁按「IP + 账号」计，不再按 IP 一把大锁。
+   原因：原来的「同 IP 连错 5 次 → 整个 IP 锁 10 分钟」会连坐 ——
+   一个人手滑输错密码，整个办公室（共用出口 IP）10 分钟全登不进来。
+   2026-11-18 实际发生过。改成：同 IP **同一账号**错 5 次 → 只锁这个账号；
+   另外保留一个宽松的 IP 级计数（30 次）防批量撞不同账号。 */
+const qLock = (ip, name) =>
+  `q:lock:${encodeURIComponent(ip)}|${encodeURIComponent(String(name || '').trim().toLowerCase())}`;
+const qLockIp = (ip) => `q:lockip:${encodeURIComponent(ip)}`;
+const Q_LOCK_ACCOUNT_MAX = 5;      /* 同账号连续错 5 次 → 锁 10 分钟 */
+const Q_LOCK_IP_MAX = 30;          /* 同 IP 跨账号错 30 次 → 锁 30 分钟 */
 const Q_REGISTER_PER_HOUR = 30;   /* 原为 5：公司共用出口 IP 时，
                                   一次培训会大家同时注册会被卡住 */
 const Q_ONLINE_WINDOW_MIN = 5;
@@ -716,6 +725,26 @@ async function handleQRegister(req, env) {
   }, 200, { 'Set-Cookie': qSetCookie(sess.token, TTL_SESSION) });
 }
 
+/* 答题站自己的失败计数：账号级 + IP 级两把计数 */
+async function bumpQFail(env, lockKey, lockIpKey) {
+  try {
+    const k = `q:fail:${lockKey}`;
+    const n = ((Number(await env.KV.get(k)) || 0) + 1);
+    await env.KV.put(k, String(n), { expirationTtl: 900 });
+    if (n >= Q_LOCK_ACCOUNT_MAX) {
+      await env.KV.put(lockKey, String(Date.now() + 10 * 60000), { expirationTtl: 900 });
+      await env.KV.delete(k);
+    }
+    const ki = `q:failip:${lockIpKey}`;
+    const m = ((Number(await env.KV.get(ki)) || 0) + 1);
+    await env.KV.put(ki, String(m), { expirationTtl: 3600 });
+    if (m >= Q_LOCK_IP_MAX) {
+      await env.KV.put(lockIpKey, String(Date.now() + 30 * 60000), { expirationTtl: 3600 });
+      await env.KV.delete(ki);
+    }
+  } catch (e) { /* 计数坏了也不能挡住登录 */ }
+}
+
 /* ---------- 答题站：登录 / 会话 / 登出 ---------- */
 async function handleQLogin(req, env) {
   const bad = assertSameOrigin(req, env);
@@ -727,11 +756,19 @@ async function handleQLogin(req, env) {
   const pwd = String(b.pwd || '');
   if (!name || !pwd) return fail('请填写账号与密码');
 
-  /* 暴力破解限速：同 IP 连续失败 5 次锁 10 分钟（限流键在 q: 空间） */
-  const lockKey = qLock(clientIp(req));
+  /* 暴力破解限速：同 IP 同一账号连错 5 次 → 只锁这个账号 10 分钟；
+     同 IP 跨账号连错 30 次 → 锁这个 IP 30 分钟（防批量撞库）。
+     ★ 不再因为「某人输错自己密码」而连坐整个办公室。 */
+  const ip = clientIp(req);
+  const lockKey = qLock(ip, name);
   const lock = await env.KV.get(lockKey);
   if (lock && Date.now() < Number(lock)) {
     return fail('失败次数过多，请 ' + Math.ceil((lock - Date.now()) / 60000) + ' 分钟后再试', 429);
+  }
+  const lockIpKey = qLockIp(ip);
+  const lockIp = await env.KV.get(lockIpKey);
+  if (lockIp && Date.now() < Number(lockIp)) {
+    return fail('本机 IP 尝试次数过多，请 ' + Math.ceil((lockIp - Date.now()) / 60000) + ' 分钟后再试', 429);
   }
 
   const id = await env.KV.get(qName(name), 'json');
@@ -742,10 +779,11 @@ async function handleQLogin(req, env) {
   }
   const { hash } = await hashPassword(pwd, user.salt, env);
   if (!safeEqual(hash, user.pwd)) {
-    await bumpFail(env, lockKey);
+    await bumpQFail(env, lockKey, lockIpKey);
     return fail('账号或密码不正确', 401);
   }
   await env.KV.delete(lockKey);
+  await env.KV.delete(lockIpKey);
 
   user.lastLoginAt = Date.now();
   await env.KV.put(qUser(id), JSON.stringify(user));
