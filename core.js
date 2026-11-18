@@ -54,6 +54,11 @@ const kLock = (ip) => `lock:${encodeURIComponent(ip)}`;
    值 { seen: "<通知 id>", at }；只存「读到哪一条」，未读条数由前端按数组下标算，
    这样加通知、删通知都不用动服务端。 */
 const kSeen = (n) => `seen:${encodeURIComponent(String(n).trim().toLowerCase())}`;
+/* ---------- 答题库状态：错题本 / 练习进度 / 考试成绩 ----------
+   键 quiz:<账号名>，值 { state, name, at }。
+   ★ 游客不落盘：所有游客共用一个账号名，写进去等于所有人的错题互相污染。
+     这种情况返回 persisted:false，前端退回本机 localStorage。 */
+const kQuiz = (n) => `quiz:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 /* ★ 被强制下线的 IP：拉黑名单，冷却期内该 IP 登不进来。
    key 是 kick:<ip>，值 { ip, at, until, by, name }，用 TTL 自然过期。
    ★ 只有拿得到真实 IP 时才写这条：Deno Deploy 不下发客户端 IP，所有人
@@ -434,6 +439,78 @@ async function bumpFail(env, lockKey) {
   }
 }
 
+/* ---------- 公开注册 ---------- */
+/* ★ 开放注册，但**只能建成普通用户**：
+   role 写死 'user'，请求里带 role 也忽略 —— 否则任何人都能自己注册成管理员。
+   ★ 限流：同一个 IP 一小时最多注册 5 个账号，防批量刷号。
+   ★ 注册完直接给会话（token + Cookie），省得再走一遍登录。 */
+const REGISTER_PER_HOUR = 5;
+
+async function handleRegister(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  if (req.method !== 'POST') return fail('仅支持 POST', 405);
+
+  let b;
+  try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+
+  const name = String(b.name || '').trim();
+  const pwd = String(b.pwd || '');
+  const ip = clientIp(req);
+  const ua = String(req.headers.get('User-Agent') || '').slice(0, 200);
+
+  if (!name || !pwd) return fail('请填写账号与密码');
+  if (name.length < 2 || name.length > 24) return fail('账号长度要 2~24 个字符');
+  if (!/^[\u4e00-\u9fa5A-Za-z0-9_.\-]+$/.test(name)) {
+    return fail('账号只能用中文、字母、数字、下划线、点和短横线');
+  }
+  if (pwd.length < 6) return fail('密码至少 6 位');
+  if (pwd.length > 64) return fail('密码太长（最多 64 位）');
+  if (await env.KV.get(kName(name))) return fail('这个账号已存在，换一个', 409);
+
+  /* 同 IP 限流 */
+  const regKey = 'reg:' + encodeURIComponent(ip || 'unknown');
+  const cnt = Number(await env.KV.get(regKey)) || 0;
+  if (cnt >= REGISTER_PER_HOUR) {
+    return fail('这个 IP 注册太频繁了，一小时后再试', 429);
+  }
+
+  const id = token().slice(0, 12);
+  const { hash, salt } = await hashPassword(pwd, null, env);
+  const u = {
+    id, name, pwd: hash, salt,
+    role: 'user',                 /* ★ 写死，注册的人一律是普通用户 */
+    enabled: true,
+    createdAt: Date.now(),
+    regIp: ip
+  };
+  await env.KV.put(kUser(id), JSON.stringify(u));
+  await env.KV.put(kName(name), JSON.stringify(id));
+  await env.KV.put(regKey, String(cnt + 1), { expirationTtl: 3600 });
+
+  /* 直接发会话 */
+  const jti = token();
+  const issuedAt = Date.now();
+  const expAt = issuedAt + TTL_SESSION * 1000;
+  const tk = await makeToken(
+    { j: jti, n: name, r: 'user', g: 0, e: expAt, a: issuedAt, i: ip },
+    env.SESSION_SECRET);
+  await env.KV.put(kSess(jti), JSON.stringify({
+    jti, name, role: 'user', ip, ua, guest: false, loginAt: issuedAt, lastSeen: issuedAt, expAt
+  }), { expirationTtl: TTL_SESSION });
+  await env.KV.put(kUid(name), JSON.stringify({
+    ip, token: tk, jti, iat: issuedAt, role: 'user', enabled: true
+  }), { expirationTtl: TTL_SESSION });
+  const ipRec = await env.KV.get(kIp(ip), 'json');
+  await env.KV.put(kIp(ip), JSON.stringify({
+    token: tk, jti, name, guest: false, lastGuestAt: (ipRec || {}).lastGuestAt || 0
+  }), { expirationTtl: TTL_SESSION });
+
+  return json({
+    ok: true, user: pubUser(name, 'user'), token: tk, expireAt: expAt, guest: false
+  }, 200, { 'Set-Cookie': setCookie(tk, TTL_SESSION) });
+}
+
 /* ---------- 游客登录 ---------- */
 async function handleGuest(req, env) {
   const ip = clientIp(req);
@@ -562,6 +639,290 @@ async function handlePing(req, env) {
   rec.expAt = s.expAt;
   await env.KV.put(key, JSON.stringify(rec), { expirationTtl: TTL_SESSION });
   return json({ ok: true, lastSeen: now });
+}
+
+/* ---------- 答题库接口 ---------- */
+const MAX_QUIZ_WRONG = 2000;
+const MAX_QUIZ_PROGRESS_Q = 5000;
+const MAX_QUIZ_EXAMS = 100;
+
+/* 前端递上来的东西一律先洗一遍再进 KV：
+   只保留认识的字段、限长限量，避免有人往 KV 里塞大对象或塞奇怪结构。 */
+function sanitizeQuizState(st) {
+  const out = { wrong: {}, progress: {}, exams: [], best: {} };
+  const str = (v, n) => String(v == null ? '' : v).replace(/[\x00-\x1F]/g, '').slice(0, n);
+
+  if (st.wrong && typeof st.wrong === 'object') {
+    let n = 0;
+    for (const qid of Object.keys(st.wrong)) {
+      if (n++ >= MAX_QUIZ_WRONG) break;
+      const id = str(qid, 64); if (!id) continue;
+      const w = st.wrong[qid] || {};
+      out.wrong[id] = {
+        first: Number(w.first) || 0,
+        last: Number(w.last) || 0,
+        times: Math.max(1, Math.min(9999, Number(w.times) || 1)),
+        board: str(w.board, 40)
+      };
+    }
+  }
+
+  if (st.progress && typeof st.progress === 'object') {
+    let total = 0;
+    for (const bid of Object.keys(st.progress)) {
+      const b = str(bid, 40); if (!b) continue;
+      const p = st.progress[bid] || {};
+      out.progress[b] = {};
+      for (const qid of Object.keys(p)) {
+        if (total++ >= MAX_QUIZ_PROGRESS_Q) break;
+        const id = str(qid, 64); if (!id) continue;
+        const it = p[qid] || {};
+        out.progress[b][id] = {
+          chosen: Math.max(0, Math.min(3, Number(it.chosen) || 0)),
+          ok: !!it.ok,
+          at: Number(it.at) || 0
+        };
+      }
+    }
+  }
+
+  if (Array.isArray(st.exams)) {
+    for (const e of st.exams.slice(-MAX_QUIZ_EXAMS)) {
+      if (!e || typeof e !== 'object') continue;
+      out.exams.push({
+        at: Number(e.at) || 0,
+        board: str(e.board, 40),
+        score: Math.max(0, Number(e.score) || 0),
+        total: Math.max(0, Number(e.total) || 0),
+        usedMs: Math.max(0, Number(e.usedMs) || 0),
+        wrongIds: Array.isArray(e.wrongIds) ? e.wrongIds.slice(0, 500).map(x => str(x, 64)) : []
+      });
+    }
+  }
+
+  if (st.best && typeof st.best === 'object') {
+    for (const bid of Object.keys(st.best)) {
+      const b = str(bid, 40); if (!b) continue;
+      const e = st.best[bid] || {};
+      out.best[b] = { score: Number(e.score) || 0, total: Number(e.total) || 0, at: Number(e.at) || 0 };
+    }
+  }
+  return out;
+}
+
+/* GET  → 这个账号的答题状态（错题本 / 进度 / 考试成绩）
+   POST → 保存（body { state }）
+   ★ 同源校验 + 会话校验 + 游客不落盘，跟 /api/notify/seen 一个套路。 */
+async function handleQuizState(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const s = await getSession(req, env);
+  if (!s) return json({ ok: false, error: 'no_session' }, 401);
+  if (Date.now() > s.expAt) return json({ ok: false, error: 'expired' }, 401);
+  if (s.guest) return json({ ok: true, state: null, persisted: false });
+
+  const key = kQuiz(s.name);
+  if (req.method === 'GET') {
+    const rec = await env.KV.get(key, 'json');
+    return json({ ok: true, state: (rec && rec.state) ? rec.state : null });
+  }
+  if (req.method === 'POST') {
+    let b; try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+    if (!b || !b.state || typeof b.state !== 'object') return fail('缺少 state');
+    const clean = sanitizeQuizState(b.state);
+    await env.KV.put(key, JSON.stringify({ state: clean, name: s.name, at: Date.now() }));
+    return json({ ok: true, saved: true });
+  }
+  return json({ ok: false, error: 'method_not_allowed' }, 405);
+}
+
+/* 全员答题情况：管理端用。取每个账号最近一次考试 + 错题数。 */
+async function handleQuizStats(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+
+  const rows = await collectQuizRows(env);
+  return json({ ok: true, rows });
+}
+
+/* ---------- 全员答题数据（汇总与导出） ---------- */
+/* 抽出来给 /api/quiz/stats 和 /api/quiz/export 共用，保证两处口径一致。 */
+async function collectQuizRows(env) {
+  const list = await env.KV.list({ prefix: 'user:' });
+  const rows = [];
+  for (const k of list.keys) {
+    const u = await env.KV.get(k.name, 'json');
+    if (!u) continue;
+    const rec = await env.KV.get(kQuiz(u.name), 'json');
+    const st = (rec && rec.state) ? rec.state : null;
+    const exams = (st && Array.isArray(st.exams)) ? st.exams : [];
+    const last = exams.length ? exams[exams.length - 1] : null;
+    const best = (st && st.best && last) ? (st.best[last.board] || null) : null;
+    rows.push({
+      name: u.name,
+      role: u.role || 'user',
+      enabled: !!u.enabled,
+      createdAt: u.createdAt || 0,
+      lastLoginAt: u.lastLoginAt || null,
+      exams: exams.length,
+      examList: exams,
+      score: last ? last.score : null,
+      total: last ? last.total : null,
+      at: last ? last.at : null,
+      wrong: (st && st.wrong) ? Object.keys(st.wrong).length : 0,
+      best: best ? { score: best.score, total: best.total, at: best.at } : null
+    });
+  }
+  rows.sort((a, b) => (b.at || 0) - (a.at || 0));
+  return rows;
+}
+
+/* CSV 单元格：含逗号/引号/换行就加引号，内部的引号翻倍 */
+function csvCell(v) {
+  let s = (v == null) ? '' : String(v);
+  if (/[",\r\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+/* 导出全员答题数据。带 UTF-8 BOM —— Excel / WPS 双击能直接认中文，
+   不带 BOM 的话 Excel 会按本地编码读，中文全是乱码。 */
+async function handleQuizExport(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+
+  const rows = await collectQuizRows(env);
+  const head = ['账号', '角色', '账号状态', '考试时间', '板块', '得分', '总题数', '得分率',
+    '用时(秒)', '累计考试次数', '最好成绩', '错题数', '注册时间', '最后登录'];
+  const lines = [head.join(',')];
+
+  const fmtTime = (t) => {
+    if (!t) return '';
+    const d = new Date(t);
+    const p = (n) => (n < 10 ? '0' + n : '' + n);
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
+      + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  };
+  const roleCn = (r) => (r === 'owner' ? '拥有者' : (r === 'admin' ? '管理员' : '普通用户'));
+
+  for (const r of rows) {
+    const base = [
+      r.name, roleCn(r.role), r.enabled ? '正常' : '已封禁',
+      fmtTime(r.at), '', r.score == null ? '' : r.score, r.total == null ? '' : r.total,
+      (r.score == null || !r.total) ? '' : (Math.round(r.score * 100 / r.total) + '%'),
+      '', r.exams,
+      r.best ? (r.best.score + '/' + r.best.total) : '',
+      r.wrong, fmtTime(r.createdAt), fmtTime(r.lastLoginAt)
+    ];
+    if (!r.examList.length) {
+      lines.push(base.map(csvCell).join(','));
+      continue;
+    }
+    /* 一场考试一行 */
+    for (const e of r.examList) {
+      const row = base.slice();
+      row[3] = fmtTime(e.at);
+      row[4] = e.board || '';
+      row[5] = e.score == null ? '' : e.score;
+      row[6] = e.total == null ? '' : e.total;
+      row[7] = (e.total ? Math.round(e.score * 100 / e.total) + '%' : '');
+      row[8] = e.usedMs ? Math.round(e.usedMs / 1000) : '';
+      lines.push(row.map(csvCell).join(','));
+    }
+  }
+
+  const csv = '\uFEFF' + lines.join('\r\n');
+  const stamp = fmtTime(Date.now()).replace(/[-: ]/g, '');
+  return new Response(csv, {
+    status: 200,
+    headers: withCors(req, env, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="quiz-data-' + stamp + '.csv"'
+    })
+  });
+}
+
+/* ---------- 一次性运维：管理员收敛 + 新站点加白 ---------- */
+/* 需要管理员会话。幂等，可以重复执行。
+ *   · 建/重置 ZM1、ZM2 为管理员（口令 ZM1 / ZM2）
+ *   · demoteOthers=true 时，把其它 admin/owner 降级成普通用户并作废其会话
+ *   · ZM1 设为拥有者：工作台有 owner 专属功能（被踢 IP 名单等），全降掉会失效
+ *   · origin 传新站点域名 → 同时写 KV 与内存，立刻生效，不用等重新部署 */
+async function handleAdminSetup(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+  if (req.method !== 'POST') return fail('仅支持 POST', 405);
+
+  let b;
+  try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
+
+  const ADMINS = [{ name: 'ZM1', pwd: 'ZM1' }, { name: 'ZM2', pwd: 'ZM2' }];
+  const created = [], updated = [];
+
+  for (const a of ADMINS) {
+    const id = await env.KV.get(kName(a.name), 'json');
+    const { hash, salt } = await hashPassword(a.pwd, null, env);
+    if (id) {
+      const u = await env.KV.get(kUser(id), 'json');
+      if (!u) continue;
+      u.pwd = hash; u.salt = salt;
+      u.role = (a.name === 'ZM1') ? 'owner' : 'admin';
+      u.enabled = true; u.pwdAt = Date.now(); u.updAt = Date.now();
+      await env.KV.put(kUser(id), JSON.stringify(u));
+      updated.push(a.name);
+    } else {
+      const nid = token().slice(0, 12);
+      await env.KV.put(kUser(nid), JSON.stringify({
+        id: nid, name: a.name, pwd: hash, salt,
+        role: (a.name === 'ZM1') ? 'owner' : 'admin',
+        enabled: true, createdAt: Date.now()
+      }));
+      await env.KV.put(kName(a.name), JSON.stringify(nid));
+      created.push(a.name);
+    }
+  }
+
+  const demoted = [];
+  if (b.demoteOthers) {
+    const list = await env.KV.list({ prefix: 'user:' });
+    for (const k of list.keys) {
+      const u = await env.KV.get(k.name, 'json');
+      if (!u) continue;
+      if (ADMINS.some((a) => a.name === u.name)) continue;
+      if (u.role !== 'admin' && u.role !== 'owner') continue;
+      u.role = 'user'; u.enabled = false; u.updAt = Date.now();
+      await env.KV.put(k.name, JSON.stringify(u));
+      const s = await env.KV.get(kUid(u.name), 'json');
+      if (s) {
+        s.role = 'user'; s.enabled = false; s.jti = '__revoked__';
+        s.iat = bumpIat(s.iat);
+        await env.KV.put(kUid(u.name), JSON.stringify(s), { expirationTtl: TTL_SESSION });
+      }
+      await purgeUserSessions(env, u.name);
+      demoted.push(u.name);
+    }
+  }
+
+  /* 新站点加白：KV 与内存都改 —— 内存里换掉就不用等重新部署 */
+  let allowOrigins = env.ALLOW_ORIGINS || '';
+  if (b.origin) {
+    const list = allowOrigins.split(',').map((x) => x.trim()).filter(Boolean);
+    if (list.indexOf(b.origin) < 0) list.push(b.origin);
+    allowOrigins = list.join(',');
+    env.ALLOW_ORIGINS = allowOrigins;
+    const cfg = await env.KV.get('config:server', 'json');
+    if (cfg) {
+      cfg.allowOrigins = allowOrigins;
+      await env.KV.put('config:server', JSON.stringify(cfg));
+    }
+  }
+
+  return json({ ok: true, created, updated, demoted, allowOrigins });
 }
 
 /* ---------- 管理后台 ---------- */
@@ -1288,6 +1649,8 @@ async function route(req, env) {
       return withJson(await handleInit(req, env), req, env);
     }
     if (p === '/api/login')   return withJson(await handleLogin(req, env), req, env);
+    /* 公开注册（只能建成普通用户） */
+    if (p === '/api/register') return withJson(await handleRegister(req, env), req, env);
     if (p === '/api/guest')   return withJson(await handleGuest(req, env), req, env);
     if (p === '/api/logout')  return withJson(await handleLogout(req, env), req, env);
     if (p === '/api/session') return withJson(await handleSession(req, env), req, env);
@@ -1296,6 +1659,14 @@ async function route(req, env) {
     if (p === '/api/notify/seen') return withJson(await handleNotifySeen(req, env), req, env);
     /* 在线心跳：工作台定时打，只为刷新 lastSeen，不返回业务数据 */
     if (p === '/api/ping') return withJson(await handlePing(req, env), req, env);
+    /* 答题库：错题本 / 练习进度 / 考试成绩（账号维度） */
+    if (p === '/api/quiz/state') return withJson(await handleQuizState(req, env), req, env);
+    /* 全员答题汇总（管理端） */
+    if (p === '/api/quiz/stats') return withJson(await handleQuizStats(req, env), req, env);
+    /* 全员答题数据导出 CSV */
+    if (p === '/api/quiz/export') return withJson(await handleQuizExport(req, env), req, env);
+    /* 一次性运维：管理员收敛 + 新站点加白 */
+    if (p === '/api/admin/setup') return withJson(await handleAdminSetup(req, env), req, env);
     if (p === '/api/bootstrap') return withJson(await handleBootstrap(req, env), req, env);
     /* ★ 必须 await。写成 `return handleProxy(...)` 的话，Promise 会直接逃出
        上面那个 try/catch —— handleProxy 里任何异步异常（上游网络错误之类）
