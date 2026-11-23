@@ -799,7 +799,8 @@ const Q_ANSWER_ALIAS = {
    · 考生没填　　　　　　→ 0.80（不是判分不准，是确实没答） */
 function qFillMatch(std, user) {
   const a = qNormText(std), b = qNormText(user);
-  if (!a || !b) return { hit: false, conf: 0.8, how: '未作答' };
+  /* 未作答：系统很确定他没答 → 判 0 分是可靠的，可信度给 1 */
+  if (!a || !b) return { hit: false, conf: 1, how: '未作答' };
   if (a === b) return { hit: true, conf: 1, how: '精确匹配' };
   const alias = Q_ANSWER_ALIAS[a];
   if (alias && alias.indexOf(b) >= 0) return { hit: true, conf: 1, how: '同义词命中' };
@@ -1183,6 +1184,7 @@ async function handleQSubmit(req, env) {
     if (q.type === 'fill') {
       const blanks = q.blanks || [];
       let sc = 0;
+      let allHit = true;
       const detail = [];
       /* 整题可信度 = 各空里最不确定的那个 */
       let conf = 1;
@@ -1190,10 +1192,13 @@ async function handleQSubmit(req, env) {
         const user = raw && typeof raw === 'object' ? (raw['b' + (i + 1)] || '') : '';
         const m = qFillMatch(blanks[i].answer, user);
         if (m.hit) sc += blanks[i].points;
+        else allHit = false;
         if (m.conf < conf) conf = m.conf;
         detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(user || ''),
           hit: m.hit, conf: m.conf, how: m.how });
       }
+      /* ★ 填空题**整题计分**：有一空没答上（没填或没匹配），这题就是 0 分，不给部分分 */
+      if (!allHit) sc = 0;
       sc = Math.max(0, Math.min(sc, q.score || 2));
       auto[q.id] = { score: sc, max: q.score || 2, kind: 'fill', done: true, conf: conf, blanks: detail };
       autoScore += sc;
