@@ -1552,6 +1552,12 @@ async function handleQNotices(req, env) {
   const key = qNotice(sess.name);
   const arr = (await env.KV.get(key, 'json')) || [];
 
+  /* DELETE：清空我的通知 */
+  if (req.method === 'DELETE') {
+    await env.KV.put(key, '[]', { expirationTtl: NOTICE_TTL });
+    return json({ ok: true, cleared: arr.length });
+  }
+
   if (req.method === 'POST') {
     let b = {};
     try { b = await qReadBody(req); } catch (e) { b = {}; }
