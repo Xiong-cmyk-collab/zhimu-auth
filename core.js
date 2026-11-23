@@ -1097,7 +1097,11 @@ async function qGunzipB64(b64) {
    并发时后写的会把先写的覆盖掉（KV 没有事务，最后写赢）。
    实测过：一场 10 道简答的考试，最后有 5 道判定丢失、显示「待判」。
    拆成独立 key 之后互不干扰。 */
-const qAiKey = (subId, qid) => 'q:sub:' + subId + ':ai:' + qid;
+/* ★ AI 判定用**独立前缀** q:ai: ——
+   原来用 q:sub:<id>:ai:<qid>，和考试记录 `q:sub:<id>` 前缀一样，
+   于是 list({prefix:'q:sub:'}) 会把几千个 AI 判定 key 全拉出来，
+   串行 get 下来直接超时 → 「待复核」列表空白/很慢。 */
+const qAiKey = (subId, qid) => 'q:ai:' + subId + ':' + qid;
 
 /* 把一次考试里所有简答题的 AI 判定读出来。
    真源 = 独立 key；老的 rec.ai 只作兜底（兼容历史记录）。 */
@@ -1412,7 +1416,7 @@ async function handleQSubmissions(req, env, path, subId) {
   if (subId) qb = await qLoadQbank(env);
   for (const k of list.keys) {
     const r = await env.KV.get(k.name, 'json');
-    if (!r) continue;
+    if (!r || !r.id) continue;   /* 不是考试记录（防御） */
     if (subId) {
       if (r.id !== subId) continue;
       const board = qFindBoard(qb, r.board);
@@ -1632,7 +1636,7 @@ async function qRetryAllDue(env, onlyName) {
   const touched = [];
   for (const k of list.keys) {
     const rec = await env.KV.get(k.name, 'json');
-    if (!rec) continue;
+    if (!rec || !rec.id) continue;   /* 不是考试记录（防御） */
     if (onlyName && rec.name !== onlyName) continue;
     scanned++;
     /* ★ 人工已定稿 → 不再 AI 判 */
@@ -1693,7 +1697,9 @@ async function handleQMySubs(req, env) {
   const rows = [];
   for (const k of list.keys) {
     const r = await env.KV.get(k.name, 'json');
-    if (!r || r.name !== sess.name) continue;
+    /* 没有 id 的不是考试记录（防御） */
+    if (!r || !r.id) continue;
+    if (r.name !== sess.name) continue;
     rows.push({
       id: r.id, board: r.board, boardName: r.boardName, at: r.at, usedMs: r.usedMs,
       score: r.finalScore, total: r.totalScore, confidence: r.confidence,
