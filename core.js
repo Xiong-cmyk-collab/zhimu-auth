@@ -821,6 +821,56 @@ function qParseAiJson(raw) {
   try { return JSON.parse(t.slice(i, j + 1)); } catch (e) { return null; }
 }
 
+/* ---------- 简答题：相似表达本地预判 ---------- */
+/* 归一化：去所有空白、全角转半角、去常见标点、转小写。
+   「16 路」「16路」「 １６ 路 」归一化后都是「16路」。 */
+function qNormMatch(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\s\u3000]/g, '')
+    .replace(/[！-～]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
+    .replace(/[，。、；：？！“”‘’（）【】《》「」『』,.!?;:"'()\[\]{}<>-]/g, '')
+    .toLowerCase();
+}
+
+/* 取得分点的核心内容：
+   「答出「16 路」」→ 「16 路」
+   「能区分出接收机应走 SBUS RC / PPM 输入」→ 原文（没有引号包裹时） */
+function qPointCore(t) {
+  let s = String(t == null ? '' : t);
+  const m = s.match(/[「『\u201c\u201d"\u2018\u2019]([^」』\u201c\u201d"\u2018\u2019]+)[」』\u201c\u201d"\u2018\u2019]/);
+  if (m) return m[1];
+  s = s.replace(/^\s*(答出|能说出|说出|提到|能区分出|答对)\s*/g, '');
+  return s;
+}
+
+/* 本地预判：哪些得分点在考生答案里出现了 */
+function qLocalPointHits(points, answer) {
+  const na = qNormMatch(answer);
+  const hits = [];
+  if (!na) return hits;
+  for (let i = 0; i < points.length; i++) {
+    const core = qPointCore(points[i].text);
+    const nc = qNormMatch(core);
+    if (!nc) continue;
+    /* 核心内容整体出现在答案里 → 命中
+       （长短都算：长的说明考生基本照写了） */
+    if (na.indexOf(nc) >= 0) { hits.push(i); continue; }
+    /* 数字 + 单位这种短片段：允许答案里数字和单位挨着出现（去掉空格后即可） */
+    const num = nc.match(/^(\d+(?:\.\d+)?)([a-z%\u00b0\u5ea6\u8def\u4e2a\u9488\u7ec4\u53f0\u6b21\u7c92\u6beb\u53f0]+)$/);
+    if (num && na.indexOf(num[1] + num[2]) >= 0) { hits.push(i); continue; }
+    /* 核心内容里含「数字+单位」且整体就是个短断言
+       （如「每组上限 1.2 A」「16 路」「1.2A」）：
+       只要答案里出现同样的数字+单位就算命中 —— 写法差异不算差别。
+       核心内容长（还夹着别的意思）时不走这条，交给模型判断。 */
+    const tok = nc.match(/(\d+(?:\.\d+)?[a-z%\u00b0\u5ea6\u8def\u4e2a\u9488\u7ec4\u53f0\u6b21\u7c92\u6beb\u53f0]+)/);
+    if (tok && nc.length <= tok[0].length + 6 && na.indexOf(tok[1]) >= 0) { hits.push(i); continue; }
+    /* 纯数字得分点（如「16」）：答案里出现同样数字且上下文含单位词 */
+    const pure = nc.match(/^(\d+(?:\.\d+)?)$/);
+    if (pure && na.indexOf(pure[1]) >= 0) { hits.push(i); }
+  }
+  return hits;
+}
+
 /* ---------- 简答题 AI 判分 ---------- */
 /* ★ 模型只回答「哪些得分点命中了」，**分数由程序按命中累加** ——
    模型就算胡说，也最多错几个点，不会凭空给出 8 分。 */
@@ -840,12 +890,19 @@ async function qAiGradeShort(env, q, userAnswer) {
     return { score: 0, max: max, hits: [], confidence: 0,
       reason: '服务端未配置模型密钥', needManual: true, pending: true };
   }
+  /* ★ 先本地做一次相似匹配：确定性的命中直接算数，
+     不依赖模型判得严不严（模型额度用尽时也不至于白丢分）。 */
+  const localHits = qLocalPointHits(points, answer);
   const pl = points.map(function (p, i) {
     return '[' + i + '] ' + p.text + '（' + p.points + ' 分）';
   }).join('\n');
   const prompt = [
     '你是培训考试判分助手。判断「考生答案」是否命中了每一个得分点。',
     '',
+    (localHits.length
+      ? '【系统预判】以下得分点在考生答案里已按「写法一致即命中」的规则匹配上，请一并算命中：'
+        + localHits.map(function (i) { return '[' + i + ']'; }).join(' ') + '\n'
+      : ''),
     '【题目】' + q.stem,
     '',
     '【参考答案】' + (q.reference || ''),
@@ -862,7 +919,10 @@ async function qAiGradeShort(env, q, userAnswer) {
     '1. 只有当考生答案**实质性地表达**了该得分点的内容才算命中；只是出现了相近的词但意思相反，不算命中。',
     '2. 没提到、答非所问、或与得分点无关的得分点，不命中。',
     '3. 允许用不同措辞表达同一个意思。',
-    '4. confidence 是你对本次判断的把握程度（0 到 1）。'
+    '4. ★ **数字、单位、空格、全半角、大小写、标点的写法差异一律不算差别**：',
+    '   得分点写「16 路」，考生写「16路」「PWM 数量为16路」「十六路输出的 PWM 通道共 16 路」都要算命中；',
+    '   得分点写「1.2 A」，考生写「1.2A」「每组 1.2 安培」也要算命中。',
+    '5. confidence 是你对本次判断的把握程度（0 到 1）。'
   ].join('\n');
 
   const body = JSON.stringify({
@@ -936,6 +996,11 @@ async function qAiGradeShort(env, q, userAnswer) {
       const i = parseInt(h, 10);
       if (Number.isInteger(i) && i >= 0 && i < points.length && hits.indexOf(i) < 0) hits.push(i);
     }
+    /* ★ 本地相似匹配命中的**并进来**：
+       写法差异（16路 / 16 路 / PWM 数量为16路）不该丢分。 */
+    for (const i of localHits) {
+      if (hits.indexOf(i) < 0) hits.push(i);
+    }
     hits.sort(function (a, b) { return a - b; });
     let score = 0;
     for (const i of hits) score += Number(points[i].points || 0);
@@ -943,6 +1008,8 @@ async function qAiGradeShort(env, q, userAnswer) {
     let conf = parseFloat(out.confidence);
     if (!Number.isFinite(conf)) conf = 0;
     conf = Math.max(0, Math.min(1, conf));
+    /* 本地确定性匹配命中了 → 置信度不能低于 0.9（模型说没命中也认） */
+    if (localHits.length && conf < 0.9) conf = 0.9;
     /* 可信度低 → 标记出来让管理员重点看 */
     const needManual = conf < 0.6 || (score === 0 && answer.length > 12);
     return {
