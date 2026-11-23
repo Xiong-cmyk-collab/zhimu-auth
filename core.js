@@ -1661,6 +1661,36 @@ async function qRetryAllDue(env, onlyName) {
   return { ok: true, scanned: scanned, due: due, skipped: skipped, redone: redone, remain: remain, touched: touched.length };
 }
 
+/* POST /api/q/admin/clear-stale-wrong —— 一键清掉全站「孤儿错题」
+   （题库换版后老题号留下的错题，点进错题本其实是空的） */
+async function handleQClearStaleWrong(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isQuizAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+  const valid = await qValidIds(env);
+  const ul = await env.KV.list({ prefix: 'q:user:' });
+  let removed = 0, users = 0;
+  for (const k of ul.keys) {
+    const u = await env.KV.get(k.name, 'json');
+    if (!u) continue;
+    const sk = qState(u.name);
+    const cur = await env.KV.get(sk, 'json');
+    if (!cur || !cur.state || !cur.state.wrong) continue;
+    const wrong = cur.state.wrong;
+    let n = 0;
+    for (const qid of Object.keys(wrong)) {
+      if (!valid[qid]) { delete wrong[qid]; n++; }
+    }
+    if (n) {
+      removed += n; users++;
+      await env.KV.put(sk, JSON.stringify({ state: cur.state, name: u.name, at: Date.now() }),
+        { expirationTtl: 60 * 60 * 24 * 365 });
+    }
+  }
+  return json({ ok: true, removed: removed, users: users });
+}
+
 /* POST /api/q/admin/clear-exams —— 清空全部考试记录（管理员）
    ★ 题库换版后清掉上一版的成绩记录（老 30 分制 vs 新 150 分制混在一起没法看）。
    · 删掉所有 q:sub:* 记录（每道题的 AI 判定独立 key 前缀一样，一起删）
@@ -2257,6 +2287,17 @@ async function handleQQuizState(req, env) {
     if (typeof st === 'string') { try { st = JSON.parse(st); } catch (e) { st = null; } }
     if (!st || typeof st !== 'object') return fail('缺少 state');
     const clean = sanitizeQuizState(st);
+    /* ★ 自动丢掉**题库里已经不存在的错题**（换版留下的孤儿）。
+       不这么做的话：管理员清掉了，但每个人浏览器的 localStorage 里还有，
+       下次 persist 又同步回来，后台永远清不干净。 */
+    try {
+      const valid = await qValidIds(env);
+      if (clean.wrong) {
+        for (const qid of Object.keys(clean.wrong)) {
+          if (!valid[qid]) delete clean.wrong[qid];
+        }
+      }
+    } catch (e) { /* 题库读不到就先不清 */ }
     /* ★ 考试记录是**服务端权威**，不能被前端整份覆盖。
        前端 persist() 推上来的是本地 state（本地没有服务端那条新记录），
        直接 put 的话会把刚写入的考试记录连同 subId/pending 一起抹掉，
@@ -2290,9 +2331,26 @@ async function handleQQuizState(req, env) {
 }
 
 /* ---------- 答题站：全员答题数据 ---------- */
+/* 当前题库里真实存在的题号集合。
+   题库换版后，老题号（v6x-001…）就成���**孤儿错题** ——
+   错题本里点开是空的，但后台还按条数统计，显示与实际对不上。 */
+async function qValidIds(env) {
+  const out = {};
+  try {
+    const qb = await qLoadQbank(env);
+    if (qb && qb.boards) {
+      for (const b of qb.boards) {
+        for (const q of (b.questions || [])) out[q.id] = 1;
+      }
+    }
+  } catch (e) { /* 题库读不到就不过滤 */ }
+  return out;
+}
+
 async function collectQuizRows(env) {
   const list = await env.KV.list({ prefix: 'q:user:' });
   const rows = [];
+  const valid = await qValidIds(env);
   for (const k of list.keys) {
     const u = await env.KV.get(k.name, 'json');
     if (!u) continue;
@@ -2307,7 +2365,11 @@ async function collectQuizRows(env) {
       exams: exams.length, examList: exams,
       score: last ? last.score : null, total: last ? last.total : null,
       at: last ? last.at : null,
-      wrong: (st && st.wrong) ? Object.keys(st.wrong).length : 0,
+      /* 错题数只算**当前题库里还有的**那些（老题号的孤儿错题不算，
+         否则后台显示 11 个、点进去却是空的） */
+      wrong: (st && st.wrong)
+        ? Object.keys(st.wrong).filter(function (k) { return valid[k]; }).length
+        : 0,
       best: best ? { score: best.score, total: best.total, at: best.at } : null
     });
   }
@@ -3437,6 +3499,7 @@ async function route(req, env) {
     if (p === '/api/q/retry-mine') return withJson(await handleQRetryGrading(req, env, true), req, env);
     if (p === '/api/q/admin/retry-grading') return withJson(await handleQRetryGrading(req, env, false), req, env);
     if (p === '/api/q/admin/clear-exams') return withJson(await handleQClearExams(req, env), req, env);
+    if (p === '/api/q/admin/clear-stale-wrong') return withJson(await handleQClearStaleWrong(req, env), req, env);
     if (p === '/api/q/submit')   return withJson(await handleQSubmit(req, env), req, env);
     if (p === '/api/q/grade-one') return withJson(await handleQGradeOne(req, env), req, env);
     if (p === '/api/q/finish')  return withJson(await handleQFinish(req, env), req, env);
