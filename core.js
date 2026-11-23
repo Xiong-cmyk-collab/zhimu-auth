@@ -899,11 +899,26 @@ async function qAiGradeShort(env, q, userAnswer) {
   }
   try {
     if (!r || !r.ok) {
-      const why = (lastStatus === 429)
-        ? '模型繁忙（限流），这道题请人工判分'
-        : (lastStatus === 'timeout' ? '判分超时，请人工判分'
-          : (lastStatus === 'neterr' ? '网络异常，请人工判分' : '模型返回 HTTP ' + lastStatus));
-      return { score: 0, max: max, hits: [], confidence: 0, reason: why, needManual: true };
+      /* ★ 把模型端的**原话**带出来。429 不一定是「每分钟请求太多」，
+         也可能是账号的 Token Plan 额度用尽 —— 管理员看到原话才知道该找谁。 */
+      let raw = '';
+      if (r) { try { raw = (await r.text()).slice(0, 300); } catch (e) { raw = ''; } }
+      let detail = '';
+      try {
+        const jj = JSON.parse(raw);
+        detail = String((jj.error && jj.error.message) || jj.message || '').slice(0, 120);
+      } catch (e) { detail = ''; }
+      let why;
+      if (lastStatus === 429) {
+        why = '模型额度用尽或被限流' + (detail ? '：' + detail : '') + ' → 这道题请人工判分';
+      } else if (lastStatus === 'timeout') {
+        why = '判分超时，请人工判分';
+      } else if (lastStatus === 'neterr') {
+        why = '网络异常，请人工判分';
+      } else {
+        why = '模型返回 HTTP ' + lastStatus + (detail ? '：' + detail : '') + ' → 请人工判分';
+      }
+      return { score: 0, max: max, hits: [], confidence: 0, reason: why, needManual: true, quotaHit: lastStatus === 429 };
     }
     const j = await r.json();
     const raw = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
