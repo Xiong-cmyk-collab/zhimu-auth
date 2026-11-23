@@ -791,23 +791,30 @@ const Q_ANSWER_ALIAS = {
   'l1': ['l1'],
   '32': ['32颗']
 };
+/* 填空题比对。★ 返回 {hit, conf, how}：
+   conf = 这次判定的**确定程度**（也就是「这道题的得分有多可靠、要不要人工再看一眼」）
+   · 精确匹配 / 同义词命中 → 1.00
+   · 数值近似命中　　　　→ 0.95
+   · 没命中　　　　　　　→ 0.50（同义词表/写法可能有缺口，值得扫一眼）
+   · 考生没填　　　　　　→ 0.80（不是判分不准，是确实没答） */
 function qFillMatch(std, user) {
   const a = qNormText(std), b = qNormText(user);
-  if (!a || !b) return false;
-  if (a === b) return true;
+  if (!a || !b) return { hit: false, conf: 0.8, how: '未作答' };
+  if (a === b) return { hit: true, conf: 1, how: '精确匹配' };
   const alias = Q_ANSWER_ALIAS[a];
-  if (alias && alias.indexOf(b) >= 0) return true;
+  if (alias && alias.indexOf(b) >= 0) return { hit: true, conf: 1, how: '同义词命中' };
   /* 数字近似：两边数字个数相同且逐个相对误差 ≤1% */
   const na = a.match(/-?\d+(?:\.\d+)?/g), nb = b.match(/-?\d+(?:\.\d+)?/g);
   if (na && nb && na.length === nb.length && na.length > 0) {
-    return na.every(function (x, i) {
+    const ok = na.every(function (x, i) {
       const fx = parseFloat(x), fy = parseFloat(nb[i]);
       if (fx === fy) return true;
       const scale = Math.max(Math.abs(fx), Math.abs(fy));
       return scale > 0 && Math.abs(fx - fy) <= scale * 0.01;
     });
+    if (ok) return { hit: true, conf: 0.95, how: '数值近似' };
   }
-  return false;
+  return { hit: false, conf: 0.5, how: '不匹配' };
 }
 
 /* ---------- 从模型输出里抠出 JSON ---------- */
@@ -1175,14 +1182,18 @@ async function handleQSubmit(req, env) {
       const blanks = q.blanks || [];
       let sc = 0;
       const detail = [];
+      /* 整题可信度 = 各空里最不确定的那个 */
+      let conf = 1;
       for (let i = 0; i < blanks.length; i++) {
         const user = raw && typeof raw === 'object' ? (raw['b' + (i + 1)] || '') : '';
-        const hit = qFillMatch(blanks[i].answer, user);
-        if (hit) sc += blanks[i].points;
-        detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(user || ''), hit: hit });
+        const m = qFillMatch(blanks[i].answer, user);
+        if (m.hit) sc += blanks[i].points;
+        if (m.conf < conf) conf = m.conf;
+        detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(user || ''),
+          hit: m.hit, conf: m.conf, how: m.how });
       }
       sc = Math.max(0, Math.min(sc, q.score || 2));
-      auto[q.id] = { score: sc, max: q.score || 2, kind: 'fill', done: true, blanks: detail };
+      auto[q.id] = { score: sc, max: q.score || 2, kind: 'fill', done: true, conf: conf, blanks: detail };
       autoScore += sc;
       continue;
     }
@@ -1408,7 +1419,11 @@ async function handleQSubmissions(req, env, path, subId) {
           explanation: q.explanation || '', source: q.source || '',
           user: r.answers ? r.answers[q.id] : '',
           auto: (r.auto && r.auto[q.id]) || null,
-          ai: aiAll[q.id] || null
+          ai: aiAll[q.id] || null,
+          /* ★ 每题的可信度：填空题用规则判的 conf，简答题用 AI 的 confidence */
+          conf: q.type === 'short'
+            ? ((aiAll[q.id] && typeof aiAll[q.id].confidence === 'number') ? aiAll[q.id].confidence : null)
+            : ((r.auto && r.auto[q.id] && typeof r.auto[q.id].conf === 'number') ? r.auto[q.id].conf : null)
         };
       }
       return json({ ok: true, sub: r, detail: detail });
@@ -1721,6 +1736,10 @@ async function handleQMySubDetail(req, env, subId) {
     const item = {
       no: q.no, seq: (q.seq != null) ? q.seq : q.no,
       type: q.type, stem: q.stem, score: q.score,
+      /* ★ 每题可信度（与管理员那边同一个口径） */
+      conf: (q.type === 'short')
+        ? ((g && typeof g.confidence === 'number') ? g.confidence : null)
+        : ((a && typeof a.conf === 'number') ? a.conf : null),
       user: rec.answers ? rec.answers[q.id] : '',
       final: fin ? fin.score : null,
       max: q.score || 0,
@@ -1736,7 +1755,8 @@ async function handleQMySubDetail(req, env, subId) {
     }
     if (q.type === 'fill' && a && Array.isArray(a.blanks)) {
       item.blanks = a.blanks.map(function (b) {
-        return { id: b.id, user: b.user, answer: b.answer, hit: !!b.hit };
+        return { id: b.id, user: b.user, answer: b.answer, hit: !!b.hit,
+          conf: (typeof b.conf === 'number') ? b.conf : null, how: b.how || '' };
       });
     }
     if (q.type === 'short' && g) {
