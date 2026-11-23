@@ -2041,18 +2041,17 @@ async function handleQNotices(req, env) {
   const key = qNotice(sess.name);
   const arr = (await env.KV.get(key, 'json')) || [];
 
-  /* DELETE：{ids:[...]} 删掉指定的几条；不传 ids = 清空全部 */
+  /* DELETE：{ids:[...]} 删掉指定的几条。
+     ★ 一键清空**彻底下线**（用户要求）：删除只能一条一条点右上角的 ✕。
+       不传 ids 的清空请求直接 404 —— 不留后门，免得谁一调用就把整批通知抹了。 */
   if (req.method === 'DELETE') {
     let b = {};
     try { b = await qReadBody(req); } catch (e) { b = {}; }
     const ids = Array.isArray(b.ids) ? b.ids.map(function (x) { return String(x); }) : null;
-    if (ids && ids.length) {
-      const keep = arr.filter(function (n) { return ids.indexOf(String(n.id)) < 0; });
-      await qNoticePut(env, key, keep);
-      return json({ ok: true, removed: arr.length - keep.length, left: keep.length });
-    }
-    await qNoticePut(env, key, []);
-    return json({ ok: true, cleared: arr.length });
+    if (!ids || !ids.length) return fail('不支持清空全部通知，请逐条删除', 404);
+    const keep = arr.filter(function (n) { return ids.indexOf(String(n.id)) < 0; });
+    await qNoticePut(env, key, keep);
+    return json({ ok: true, removed: arr.length - keep.length, left: keep.length });
   }
 
   if (req.method === 'POST') {
