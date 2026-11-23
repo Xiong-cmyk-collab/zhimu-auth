@@ -1393,7 +1393,7 @@ async function qAfterGrading(env, rec, board) {
     '「' + rec.boardName + '」考试已完成初步判分：AI 建议得分 ' + rec.finalScore
     + ' / ' + rec.totalScore + '，整体可信度 ' + rec.confidence + '%。'
     + '这只是初步结果，管理员会逐题复核，最终成绩以复核结果为准。',
-    '#/admin');
+    '#/');
 }
 
 /* ---------- 复核相关 ---------- */
@@ -1551,7 +1551,7 @@ async function handleQReview(req, env, subId) {
   await qNotify(env, rec.name, 'review_done', '考试评价已完成',
     admin.name + ' 已完成你的「' + rec.boardName + '」考试评价，最终得分 ' + score + ' / '
     + rec.totalScore + '（' + (rec.totalScore ? Math.round(score * 100 / rec.totalScore) : 0)
-    + '%）。复核明细可以在「我的考试记录」里逐题查看。', '#/review', admin.name);
+    + '%）。复核明细可以在「我的考试记录」里逐题查看。', '#/', admin.name);
   return json({ ok: true, finalScore: score, totalScore: rec.totalScore });
 }
 
@@ -2433,7 +2433,7 @@ async function handleQAdminUsers(req, env, path) {
         u.role === 'admin'
           ? admin.name + ' 已将你设为答题库管理员，现在你可以查看全员答题数据、导出报表、管理账号。你原有的学习记录不受影响。'
           : admin.name + ' 已取消你的管理员身份。你原有的学习记录、错题本和考试成绩都不受影响，仍然可以正常答题。',
-        '#/admin', admin.name);
+        '#/', admin.name);
     }
     if (u.enabled === false && oldEnabled) {
       await qNotify(env, u.name, 'banned', '账号已被停用',
