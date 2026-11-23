@@ -1725,6 +1725,46 @@ async function handleQMySubs(req, env) {
   return json({ ok: true, rows: rows });
 }
 
+/* DELETE /api/q/my/subs/:id —— 答题人删**自己**的一条考试记录
+   ★ 汇总里有、明细已经没了的记录也要能删得掉（原来的
+     DELETE /api/q/submissions/:id 要求明细存在才摘汇总，碰上就 404 了）。 */
+async function handleQMySubDelete(req, env, subId) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+
+  const key = 'q:sub:' + subId;
+  const rec = await env.KV.get(key, 'json');
+  if (rec && rec.name !== sess.name) return fail('只能删除自己的考试记录', 403);
+
+  /* 明细 + 每题的 AI 判定（有才删） */
+  const qb = await qLoadQbank(env);
+  const board = qFindBoard(qb, rec ? rec.board : null);
+  const dels = ((board && board.questions) || []).map(function (q) {
+    return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
+  });
+  await Promise.all(dels);
+  try { await env.KV.delete(key); } catch (e) { /* 忽略 */ }
+
+  /* 成绩汇总里摘掉这一条（明细不在也要摘） */
+  let removed = 0;
+  try {
+    const sk = qState(sess.name);
+    const cur = (await env.KV.get(sk, 'json')) || {};
+    const st = (cur.state && typeof cur.state === 'object') ? cur.state : null;
+    if (st && Array.isArray(st.exams)) {
+      const before = st.exams.length;
+      st.exams = st.exams.filter(function (e) { return e.subId !== subId; });
+      removed = before - st.exams.length;
+      await env.KV.put(sk, JSON.stringify({ state: st, name: sess.name, at: Date.now() }),
+        { expirationTtl: 60 * 60 * 24 * 365 });
+    }
+  } catch (e) { /* 忽略 */ }
+
+  return json({ ok: true, id: subId, removed: removed });
+}
+
 /* GET /api/q/my/subs/:id —— 用户查**自己**那次的逐题明细
    ★ 只给他自己的答案 + AI 判定 + 最终得分，**不下发标准答案/得分点**：
      否则用户做完就能翻出答案背下一次考试，题库就废了。 */
@@ -3468,6 +3508,7 @@ async function route(req, env) {
     if (p === '/api/q/my/subs') return withJson(await handleQMySubs(req, env), req, env);
     if (p.startsWith('/api/q/my/subs/')) {
       const mid = decodeURIComponent(p.replace('/api/q/my/subs/', ''));
+      if (req.method === 'DELETE') return withJson(await handleQMySubDelete(req, env, mid), req, env);
       return withJson(await handleQMySubDetail(req, env, mid), req, env);
     }
     if (p === '/api/q/submissions') return withJson(await handleQSubmissions(req, env, p, ''), req, env);
