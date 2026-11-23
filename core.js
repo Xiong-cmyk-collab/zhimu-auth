@@ -646,8 +646,8 @@ const qLock = (ip, name) =>
 const qLockIp = (ip) => `q:lockip:${encodeURIComponent(ip)}`;
 const Q_LOCK_ACCOUNT_MAX = 5;      /* 同账号连续错 5 次 → 锁 10 分钟 */
 const Q_LOCK_IP_MAX = 30;          /* 同 IP 跨账号错 30 次 → 锁 30 分钟 */
-const Q_REGISTER_PER_HOUR = 30;   /* 原为 5：公司共用出口 IP 时，
-                                  一次培训会大家同时注册会被卡住 */
+const Q_REGISTER_PER_HOUR = 30;   /* 单台设备每小时最多注册多少个（见 handleQRegister） */
+const Q_REGISTER_PER_HOUR_GLOBAL = 500; /* 全站每小时注册上限（兜底，防换设备批量刷） */
 const Q_ONLINE_WINDOW_MIN = 5;
 
 function qSetCookie(tk, maxAge) {
@@ -1943,9 +1943,19 @@ async function handleQRegister(req, env) {
   if (pwd.length > 64) return fail('密码太长（最多 64 位）');
   if (await env.KV.get(qName(name))) return fail('这个账号已存在，换一个', 409);
 
-  const regKey = 'q:reg:' + encodeURIComponent(ip || 'unknown');
+  /* ★ 限流按**设备**算，不用 IP ——
+     Deno Deploy 不传真实 IP（clientIp 恒为 'unknown'），
+     按 IP 算等于**全站共用一个桶**：一个人批量注册就能把同事的正常注册一起封掉。
+     现在：主桶按设备（did），再叠一个全局兜底桶防批量刷。 */
+  const did = String(b.did || '').slice(0, 64);
+  const regKey = 'q:reg:' + (did
+    ? 'd:' + encodeURIComponent(did)
+    : 'ip:' + encodeURIComponent(ip || 'unknown'));
   const cnt = Number(await env.KV.get(regKey)) || 0;
-  if (cnt >= Q_REGISTER_PER_HOUR) return fail('这个 IP 注册太频繁了，一小时后再试', 429);
+  if (cnt >= Q_REGISTER_PER_HOUR) return fail('这台设备注册太频繁了，一小时后再试', 429);
+  const gKey = 'q:reg:global';
+  const gcnt = Number(await env.KV.get(gKey)) || 0;
+  if (gcnt >= Q_REGISTER_PER_HOUR_GLOBAL) return fail('注册请求过多，请稍后再试', 429);
 
   const id = token().slice(0, 12);
   const { hash, salt } = await hashPassword(pwd, null, env);
@@ -1954,6 +1964,7 @@ async function handleQRegister(req, env) {
   await env.KV.put(qUser(id), JSON.stringify(u));
   await env.KV.put(qName(name), JSON.stringify(id));
   await env.KV.put(regKey, String(cnt + 1), { expirationTtl: 3600 });
+  await env.KV.put(gKey, String(gcnt + 1), { expirationTtl: 3600 });
 
   const sess = await qIssueSession(env, Object.assign({}, u, { keep: parseKeep(b.keep) }),
     req, String(b.did || '').slice(0, 64));
