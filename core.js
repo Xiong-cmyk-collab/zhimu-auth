@@ -1031,8 +1031,9 @@ async function qAiGradeShort(env, q, userAnswer) {
   }
 }
 
-/* 写一条通知。★ 通知写失败**绝不能影响主流程**（封禁/改角色照样要成功） */
-async function qNotify(env, name, type, title, body, link) {
+/* 写一条通知。★ 通知写失败**绝不能影响主流程**（封禁/改角色照样要成功）
+   who = 动作发起人（不是收件人）。前端用它把正文里的名字高亮。 */
+async function qNotify(env, name, type, title, body, link, who) {
   if (!name) return;
   try {
     const key = qNotice(name);
@@ -1043,6 +1044,7 @@ async function qNotify(env, name, type, title, body, link) {
       title: title || '',
       body: body || '',
       link: link || '',
+      who: who || '',
       at: Date.now(),
       read: false
     });
@@ -1376,7 +1378,7 @@ async function qAfterGrading(env, rec, board) {
       rec.name + ' 刚提交了「' + rec.boardName + '」考试。AI 建议得分 ' + rec.finalScore
       + ' / ' + rec.totalScore + '，整体可信度 ' + rec.confidence + '%。'
       + (rec.shortCount ? rec.shortCount + ' 道简答题由 AI 判定，建议优先复核其中可信度偏低的几题。' : ''),
-      '#/admin');
+      '#/review', rec.name);
   }
   /* 通知答题人 */
   await qNotify(env, rec.name, 'grading_done', '等待管理员复核',
@@ -1536,7 +1538,7 @@ async function handleQReview(req, env, subId) {
   await qNotify(env, rec.name, 'review_done', '考试评价已完成',
     admin.name + ' 已完成你的「' + rec.boardName + '」考试评价，最终得分 ' + score + ' / '
     + rec.totalScore + '（' + (rec.totalScore ? Math.round(score * 100 / rec.totalScore) : 0)
-    + '%）。复核明细可以在「我的考试记录」里逐题查看。', '#/admin');
+    + '%）。复核明细可以在「我的考试记录」里逐题查看。', '#/review', admin.name);
   return json({ ok: true, finalScore: score, totalScore: rec.totalScore });
 }
 
@@ -1635,7 +1637,7 @@ async function qRetryAllDue(env, onlyName) {
           '有考试已重新判分，请复核',
           t.name + ' 的「' + t.board + '」考试刚刚重新判分，AI 建议得分 ' + t.score
           + '。' + (t.remain ? ('还有 ' + t.remain + ' 道题没判出来。') : '全部题目都判出来了。')
-          + '请到「待复核」里确认。', '#/review');
+          + '请到「待复核」里确认。', '#/review', t.name);
       }
     }
   }
@@ -2417,18 +2419,18 @@ async function handleQAdminUsers(req, env, path) {
         u.role === 'admin'
           ? admin.name + ' 已将你设为答题库管理员，现在你可以查看全员答题数据、导出报表、管理账号。你原有的学习记录不受影响。'
           : admin.name + ' 已取消你的管理员身份。你原有的学习记录、错题本和考试成绩都不受影响，仍然可以正常答题。',
-        '#/admin');
+        '#/admin', admin.name);
     }
     if (u.enabled === false && oldEnabled) {
       await qNotify(env, u.name, 'banned', '账号已被停用',
-        admin.name + ' 已停用你的账号，暂时无法登录。如有疑问请联系管理员。', '');
+        admin.name + ' 已停用你的账号，暂时无法登录。如有疑问请联系管理员。', '', admin.name);
     } else if (u.enabled !== false && !oldEnabled) {
       await qNotify(env, u.name, 'unbanned', '账号已恢复',
-        admin.name + ' 已恢复你的账号，可以正常登录了。', '');
+        admin.name + ' 已恢复你的账号，可以正常登录了。', '', admin.name);
     }
     if (b.pwd) {
       await qNotify(env, u.name, 'pwd_reset', '密码已被重置',
-        admin.name + ' 已重置你的密码，请用新密码登录。', '#/login');
+        admin.name + ' 已重置你的密码，请用新密码登录。', '#/login', admin.name);
     }
     u.updAt = Date.now();
     await env.KV.put(qUser(id), JSON.stringify(u));
