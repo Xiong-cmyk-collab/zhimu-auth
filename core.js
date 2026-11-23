@@ -970,6 +970,25 @@ async function qGunzipB64(b64) {
 }
 
 /* ---------- 交卷 / 判分 / 复核 ---------- */
+/* ★ 每道简答题的 AI 判定写**独立 key**。
+   为什么不能都塞在同一条考试记录里：grade-one 是「读整条 → 改一个字段 → 整条写回」，
+   并发时后写的会把先写的覆盖掉（KV 没有事务，最后写赢）。
+   实测过：一场 10 道简答的考试，最后有 5 道判定丢失、显示「待判」。
+   拆成独立 key 之后互不干扰。 */
+const qAiKey = (subId, qid) => 'q:sub:' + subId + ':ai:' + qid;
+
+/* 把一次考试里所有简答题的 AI 判定读出来。
+   真源 = 独立 key；老的 rec.ai 只作兜底（兼容历史记录）。 */
+async function qGatherAi(env, subId, qids, fallback) {
+  const out = {};
+  for (const qid of qids) {
+    let g = null;
+    try { g = await env.KV.get(qAiKey(subId, qid), 'json'); } catch (e) { g = null; }
+    if (!g && fallback && fallback[qid]) g = fallback[qid];
+    if (g) out[qid] = g;
+  }
+  return out;
+}
 /* ★ 题库进程内缓存：题库是 gzip 分块存的，每次读都要拉 4 个 KV 块再解压，
    复核详情页一次要读好几遍（列表、判分、详情），没有缓存要等 3~5 秒。
    60 秒过期，写题库时立刻失效。 */
@@ -1119,6 +1138,9 @@ async function handleQGradeOne(req, env) {
 
   const raw = rec.answers ? rec.answers[qid] : '';
   const g = await qAiGradeShort(env, q, raw);
+  /* ★ 写独立 key（并发安全） */
+  await env.KV.put(qAiKey(subId, qid), JSON.stringify(g), { expirationTtl: 60 * 60 * 24 * 180 });
+  /* 考试记录里也同步一份（调试/兜底用；不再作为唯一真源） */
   rec.ai = rec.ai || {};
   rec.ai[qid] = g;
   await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
@@ -1144,9 +1166,13 @@ async function handleQFinish(req, env) {
 
   let score = 0, confSum = 0, confN = 0, shortCount = 0, shortMax = 0, pending = 0;
   const perQ = {};
+  /* ★ 汇总时按题读**独立 key**，避免并发写入互相覆盖导致的「丢结果」 */
+  const shortIds = ((board && board.questions) || []).filter(function (q) { return q.type === 'short'; })
+    .map(function (q) { return q.id; });
+  const aiAll = await qGatherAi(env, subId, shortIds, rec.ai);
   for (const q of ((board && board.questions) || [])) {
     const a = rec.auto && rec.auto[q.id];
-    const g = rec.ai && rec.ai[q.id];
+    const g = aiAll[q.id];
     if (q.type === 'short') {
       shortCount++; shortMax += (q.score || 3);
       if (g) {
@@ -1242,6 +1268,9 @@ async function handleQSubmissions(req, env, path, subId) {
       if (r.id !== subId) continue;
       const board = qFindBoard(qb, r.board);
       const detail = {};
+      /* ★ 同上：逐题读独立 key */
+      const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+      const aiAll = await qGatherAi(env, r.id, ids, r.ai);
       for (const q of ((board && board.questions) || [])) {
         detail[q.id] = {
           no: q.no, seq: (q.seq != null) ? q.seq : q.no,
@@ -1254,7 +1283,7 @@ async function handleQSubmissions(req, env, path, subId) {
           explanation: q.explanation || '', source: q.source || '',
           user: r.answers ? r.answers[q.id] : '',
           auto: (r.auto && r.auto[q.id]) || null,
-          ai: (r.ai && r.ai[q.id]) || null
+          ai: aiAll[q.id] || null
         };
       }
       return json({ ok: true, sub: r, detail: detail });
@@ -1288,9 +1317,11 @@ async function handleQReview(req, env, subId) {
   const board = qFindBoard(qb, rec.board);
   const finalPer = {};
   let score = 0;
+  const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+  const aiAll = await qGatherAi(env, subId, ids, rec.ai);
   for (const q of ((board && board.questions) || [])) {
     const a = rec.auto && rec.auto[q.id];
-    const g = rec.ai && rec.ai[q.id];
+    const g = aiAll[q.id];
     let sc = null;
     if (Object.prototype.hasOwnProperty.call(perQ, q.id)) {
       const v = Number(perQ[q.id]);
@@ -1371,9 +1402,11 @@ async function handleQMySubDetail(req, env, subId) {
   const qb = await qLoadQbank(env);
   const board = qFindBoard(qb, rec.board);
   const detail = {};
+  const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+  const aiAll = await qGatherAi(env, subId, ids, rec.ai);
   for (const q of ((board && board.questions) || [])) {
     const a = (rec.auto && rec.auto[q.id]) || null;
-    const g = (rec.ai && rec.ai[q.id]) || null;
+    const g = aiAll[q.id] || null;
     const fin = (rec.perQ && rec.perQ[q.id]) ? rec.perQ[q.id] : null;
     const item = {
       no: q.no, seq: (q.seq != null) ? q.seq : q.no,
