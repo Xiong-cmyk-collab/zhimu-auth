@@ -1398,7 +1398,9 @@ async function handleQAdminSetup(req, env) {
     } else {
       const nid = token().slice(0, 12);
       await env.KV.put(qUser(nid), JSON.stringify({
-        id: nid, name: a.name, pwd: hash, salt, role: 'admin', enabled: true, createdAt: Date.now()
+        /* ★ 新建分支也要是 owner —— 之前只在「更新」分支改了 role，
+           导致账号被删后重建会变成 admin，拥有者就只剩一个了。 */
+        id: nid, name: a.name, pwd: hash, salt, role: 'owner', enabled: true, createdAt: Date.now()
       }));
       await env.KV.put(qName(a.name), JSON.stringify(nid));
       created.push(a.name);
