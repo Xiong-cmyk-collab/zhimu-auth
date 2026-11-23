@@ -936,10 +936,59 @@ async function qNotify(env, name, type, title, body, link) {
   }
 }
 
+/* ---------- 题库存取（gzip + base64 + 分块） ----------
+   ★ Deno KV 单个 value 上限 64 KiB，100 题 × 2 板块的题库 JSON 有 ~190 KB，
+     直接存会报 "Value too large (max 65536 bytes)"。
+     所以：gzip → base64 → 分块（每块 56 KB）写到 q:qbank:c0/c1/…，
+     头信息（块数、编码）写在 q:qbank，读取时拼回来解压。 */
+const Q_QBANK_CHUNK = 'q:qbank:c';
+const Q_QBANK_CHUNK_SIZE = 56000;
+
+async function qGzipB64(text) {
+  const bytes = new TextEncoder().encode(text);
+  const cs = new CompressionStream('gzip');
+  const w = cs.writable.getWriter();
+  w.write(bytes);
+  w.close();
+  const buf = new Uint8Array(await new Response(cs.readable).arrayBuffer());
+  let s = '';
+  for (let i = 0; i < buf.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+async function qGunzipB64(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const ds = new DecompressionStream('gzip');
+  const w = ds.writable.getWriter();
+  w.write(bytes);
+  w.close();
+  const out = await new Response(ds.readable).arrayBuffer();
+  return new TextDecoder().decode(out);
+}
+
 /* ---------- 交卷 / 判分 / 复核 ---------- */
 async function qLoadQbank(env) {
-  const rec = await env.KV.get(Q_QBANK, 'json');
-  return (rec && rec.boards) ? rec : null;
+  let head = null;
+  try { head = await env.KV.get(Q_QBANK, 'json'); } catch (e) { head = null; }
+  if (!head || !head.chunks) return null;
+  let raw = '';
+  for (let i = 0; i < head.chunks; i++) {
+    let c = null;
+    try { c = await env.KV.get(Q_QBANK_CHUNK + i); } catch (e) { c = null; }
+    if (c == null) return null;
+    raw += c;
+  }
+  let text;
+  try {
+    text = (head.codec === 'gz64') ? await qGunzipB64(raw) : raw;
+  } catch (e) { return null; }
+  try {
+    const rec = JSON.parse(text);
+    return (rec && rec.boards) ? rec : null;
+  } catch (e) { return null; }
 }
 function qFindBoard(qb, boardId) {
   if (!qb) return null;
@@ -1170,12 +1219,13 @@ async function handleQSubmissions(req, env, path, subId) {
 
   const list = await env.KV.list({ prefix: 'q:sub:' });
   const rows = [];
+  let qb = null;
+  if (subId) qb = await qLoadQbank(env);
   for (const k of list.keys) {
     const r = await env.KV.get(k.name, 'json');
     if (!r) continue;
     if (subId) {
       if (r.id !== subId) continue;
-      const qb = await qLoadQbank(env);
       const board = qFindBoard(qb, r.board);
       const detail = {};
       for (const q of ((board && board.questions) || [])) {
@@ -1366,9 +1416,30 @@ async function handleQAdminConfig(req, env, what) {
   if (what === 'qbank') {
     if (!b || !Array.isArray(b.boards)) return fail('缺少 boards');
     const rec = { version: String(b.version || ''), boards: b.boards, at: Date.now() };
-    await env.KV.put(Q_QBANK, JSON.stringify(rec));
-    const n = b.boards.reduce(function (a, x) { return a + ((x.questions || []).length); }, 0);
-    return json({ ok: true, boards: b.boards.length, questions: n });
+    const text = JSON.stringify(rec);
+    /* 压缩优先；运行环境没有 CompressionStream 就退回明文分块 */
+    const canGzip = (typeof CompressionStream !== 'undefined');
+    let payload = text;
+    if (canGzip) {
+      try { payload = await qGzipB64(text); } catch (e) { payload = text; }
+    }
+    const codec = (payload !== text) ? 'gz64' : 'raw';
+    const n = Math.max(1, Math.ceil(payload.length / Q_QBANK_CHUNK_SIZE));
+    for (let i = 0; i < n; i++) {
+      await env.KV.put(Q_QBANK_CHUNK + i, payload.slice(i * Q_QBANK_CHUNK_SIZE, (i + 1) * Q_QBANK_CHUNK_SIZE));
+    }
+    /* 清掉上一版多余的块（从 n 开始往后找，碰到空就停） */
+    for (let i = n; i < n + 20; i++) {
+      const old = await env.KV.get(Q_QBANK_CHUNK + i);
+      if (old == null) break;
+      await env.KV.delete(Q_QBANK_CHUNK + i);
+    }
+    await env.KV.put(Q_QBANK, JSON.stringify({
+      v: 1, codec: codec, chunks: n, size: payload.length, at: Date.now()
+    }));
+    const cnt = b.boards.reduce(function (a, x) { return a + ((x.questions || []).length); }, 0);
+    return json({ ok: true, boards: b.boards.length, questions: cnt,
+      bytes: payload.length, chunks: n, codec: codec });
   }
   /* aicfg：
      ★ key 留空 = **保持原密钥不变**（原来留空等于清空，一不小心就把判分通道弄挂了）。
