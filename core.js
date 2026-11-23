@@ -2555,6 +2555,18 @@ async function handleQQuizState(req, env) {
     if (typeof st === 'string') { try { st = JSON.parse(st); } catch (e) { st = null; } }
     if (!st || typeof st !== 'object') return fail('缺少 state');
     const clean = sanitizeQuizState(st);
+    /* ★★ 错题本闸门：服务端清空过错题本之后（wrongResetAt 变新），
+       **老客户端**推来的 wrong 是清空之前的旧数据 —— 直接丢弃，
+       否则它一同步就把错题推回来（用户要求「这一次全部清空」就得真清干净）。
+       新客户端不受影响：merge 时已按 wrongResetAt 作废本机缓存并对齐了时间戳。 */
+    try {
+      const prevRec = await env.KV.get(key, 'json');
+      const prevState = (prevRec && prevRec.state) ? prevRec.state : null;
+      const prevReset = (prevState && typeof prevState.wrongResetAt === 'number')
+        ? prevState.wrongResetAt : 0;
+      const clientReset = Number(clean.wrongResetAt) || 0;
+      if (prevReset > clientReset) clean.wrong = {};
+    } catch (e) { /* 读不到就按原样处理 */ }
     /* ★ 自动丢掉**题库里已经不存在的错题**（换版留下的孤儿）。
        不这么做的话：管理员清掉了，但每个人浏览器的 localStorage 里还有，
        下次 persist 又同步回来，后台永远清不干净。 */
