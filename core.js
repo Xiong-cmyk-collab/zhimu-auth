@@ -832,11 +832,13 @@ async function qAiGradeShort(env, q, userAnswer) {
     return { score: 0, max: max, hits: [], confidence: 0, reason: '题目没有得分点', needManual: true };
   }
   if (!answer) {
+    /* 「未作答」是正常结果，不是判分失败 —— 不用重判 */
     return { score: 0, max: max, hits: [], confidence: 0, reason: '未作答', needManual: true };
   }
   const cfg = await qModelConfig(env);
   if (!cfg.key) {
-    return { score: 0, max: max, hits: [], confidence: 0, reason: '服务端未配置模型密钥', needManual: true };
+    return { score: 0, max: max, hits: [], confidence: 0,
+      reason: '服务端未配置模型密钥', needManual: true, pending: true };
   }
   const pl = points.map(function (p, i) {
     return '[' + i + '] ' + p.text + '（' + p.points + ' 分）';
@@ -918,14 +920,15 @@ async function qAiGradeShort(env, q, userAnswer) {
       } else {
         why = '模型返回 HTTP ' + lastStatus + (detail ? '：' + detail : '') + ' → 请人工判分';
       }
-      return { score: 0, max: max, hits: [], confidence: 0, reason: why, needManual: true, quotaHit: lastStatus === 429 };
+      return { score: 0, max: max, hits: [], confidence: 0, reason: why,
+        needManual: true, pending: true, quotaHit: lastStatus === 429 };
     }
     const j = await r.json();
     const raw = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
     const out = qParseAiJson(raw);
     if (!out || !Array.isArray(out.hits)) {
       return { score: 0, max: max, hits: [], confidence: 0,
-        reason: '模型输出无法解析，需人工判分', needManual: true };
+        reason: '模型输出无法解析，需人工判分', needManual: true, pending: true };
     }
     /* 只接受合法范围内的编号 */
     const hits = [];
@@ -949,7 +952,8 @@ async function qAiGradeShort(env, q, userAnswer) {
     };
   } catch (e) {
     const msg = (e && e.name === 'AbortError') ? '判分超时' : ('判分失败：' + ((e && e.message) || e));
-    return { score: 0, max: max, hits: [], confidence: 0, reason: msg, needManual: true };
+    return { score: 0, max: max, hits: [], confidence: 0, reason: msg,
+      needManual: true, pending: true };
   }
 }
 
@@ -1181,6 +1185,14 @@ async function handleQGradeOne(req, env) {
   /* 考试记录里也同步一份（调试/兜底用；不再作为唯一真源） */
   rec.ai = rec.ai || {};
   rec.ai[qid] = g;
+  /* ★ 没判出来的题记下来，5 小时后自动重判 */
+  rec.pendingAi = Array.isArray(rec.pendingAi) ? rec.pendingAi : [];
+  if (g && g.pending) {
+    if (rec.pendingAi.indexOf(qid) < 0) rec.pendingAi.push(qid);
+    if (!rec.retryAt) rec.retryAt = Date.now() + Q_RETRY_DELAY_MS;
+  } else {
+    rec.pendingAi = rec.pendingAi.filter(function (x) { return x !== qid; });
+  }
   await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
   return json({ ok: true, qid: qid, result: g });
 }
@@ -1232,6 +1244,14 @@ async function handleQFinish(req, env) {
   rec.shortCount = shortCount;
   rec.shortMax = shortMax;
   rec.pendingCount = pending;
+  /* ★ 没判出分的简答题：记下来，5 小时后自动重判 */
+  const stillPend = [];
+  for (const qid of shortIds) {
+    const g = aiAll[qid];
+    if (!g || g.pending) stillPend.push(qid);
+  }
+  rec.pendingAi = stillPend;
+  rec.retryAt = stillPend.length ? (rec.retryAt || (Date.now() + Q_RETRY_DELAY_MS)) : null;
   await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
 
   if (!pending) await qAfterGrading(env, rec, board);
@@ -1438,6 +1458,125 @@ async function handleQReview(req, env, subId) {
   return json({ ok: true, finalScore: score, totalScore: rec.totalScore });
 }
 
+/* ---------- 延迟重判（AI 没判出分的简答题，5 小时后再来一次） ---------- */
+/* ★ 人工已经复核过的（status='reviewed'）一律跳过 ——
+   管理员都定稿了，AI 再判一遍把分数改回去才是添乱。 */
+const Q_RETRY_DELAY_MS = 5 * 60 * 60 * 1000;   /* 5 小时 */
+const Q_RETRY_BUDGET_MS = 100000;              /* 一轮重判最多跑 100 秒 */
+
+async function qRetryOne(env, rec, board, now) {
+  const pend = (rec.pendingAi || []).slice();
+  if (!pend.length) return { done: 0, remain: 0, ok: true };
+  const qs = ((board && board.questions) || []).filter(function (q) {
+    return pend.indexOf(q.id) >= 0;
+  });
+  let done = 0;
+  const still = [];
+  const t0 = Date.now();
+  for (const q of qs) {
+    if (Date.now() - t0 > Q_RETRY_BUDGET_MS) { still.push(q.id); continue; }
+    const raw = rec.answers ? rec.answers[q.id] : '';
+    const g = await qAiGradeShort(env, q, raw);
+    if (g && g.pending) { still.push(q.id); continue; }
+    await env.KV.put(qAiKey(rec.id, q.id), JSON.stringify(g), { expirationTtl: 60 * 60 * 24 * 180 });
+    rec.ai = rec.ai || {};
+    rec.ai[q.id] = g;
+    done++;
+  }
+  /* 没轮到 / 还失败的留到下一轮 */
+  for (const qid of pend) {
+    if (still.indexOf(qid) < 0 && !qs.some(function (q) { return q.id === qid; })) still.push(qid);
+  }
+  rec.pendingAi = still;
+
+  /* 重新汇总总分与可信度 */
+  const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+  const aiAll = await qGatherAi(env, rec.id, ids, rec.ai);
+  let score = 0, confSum = 0, confN = 0;
+  const perQ = {};
+  for (const q of ((board && board.questions) || [])) {
+    const a = rec.auto && rec.auto[q.id];
+    const g = aiAll[q.id];
+    let sc = 0;
+    if (q.type === 'short') {
+      sc = g ? g.score : 0;
+      if (g) { confSum += g.confidence; confN++; }
+    } else if (a) sc = a.score;
+    perQ[q.id] = { score: sc, max: q.score || 0 };
+    score += sc;
+  }
+  rec.perQ = perQ;
+  rec.finalScore = score;
+  rec.confidence = confN ? Math.round((confSum / confN) * 100) : rec.confidence;
+  rec.pendingCount = still.length;
+  if (!still.length) {
+    rec.retryAt = null;
+    rec.status = 'pending_review';
+  } else {
+    /* 还剩几道没判出来：半小时后再试一轮（额度可能已经恢复） */
+    rec.retryAt = now + 30 * 60 * 1000;
+  }
+  return { done: done, remain: still.length, ok: true, score: score };
+}
+
+/* 扫全部提交，把到期的重判一遍。onlyName 限定只处理某个人的。 */
+async function qRetryAllDue(env, onlyName) {
+  const now = Date.now();
+  const list = await env.KV.list({ prefix: 'q:sub:' });
+  const qb = await qLoadQbank(env);
+  let scanned = 0, due = 0, skipped = 0, redone = 0, remain = 0;
+  const touched = [];
+  for (const k of list.keys) {
+    const rec = await env.KV.get(k.name, 'json');
+    if (!rec) continue;
+    if (onlyName && rec.name !== onlyName) continue;
+    scanned++;
+    /* ★ 人工已定稿 → 不再 AI 判 */
+    if (rec.status === 'reviewed') { skipped++; continue; }
+    const pend = rec.pendingAi || [];
+    if (!pend.length) continue;
+    if ((rec.retryAt || 0) > now) continue;      /* 还没到重判时间 */
+    due++;
+    const board = qFindBoard(qb, rec.board);
+    const r = await qRetryOne(env, rec, board, now);
+    redone += r.done; remain += r.remain;
+    await env.KV.put('q:sub:' + rec.id, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+    if (r.done) touched.push({ id: rec.id, name: rec.name, board: rec.boardName, score: r.score, remain: r.remain });
+  }
+  /* 重判出分的，通知管理员去复核 */
+  for (const t of touched) {
+    const users = await env.KV.list({ prefix: 'q:user:' });
+    for (const uk of users.keys) {
+      const u = await env.KV.get(uk.name, 'json');
+      if (u && u.enabled && (u.role === 'admin' || u.role === 'owner')) {
+        await qNotify(env, u.name, 'review_new',
+          '有考试已重新判分，请复核',
+          t.name + ' 的「' + t.board + '」考试刚刚重新判分，AI 建议得分 ' + t.score
+          + '。' + (t.remain ? ('还有 ' + t.remain + ' 道题没判出来。') : '全部题目都判出来了。')
+          + '请到「待复核」里确认。', '#/review');
+      }
+    }
+  }
+  return { ok: true, scanned: scanned, due: due, skipped: skipped, redone: redone, remain: remain, touched: touched.length };
+}
+
+/* POST /api/q/admin/retry-grading —— 管理员手动触发重判
+   POST /api/q/retry-mine        —— 答题人触发重判自己的 */
+async function handleQRetryGrading(req, env, mine) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  if (mine) {
+    const sess = await getQuizSession(req, env);
+    if (!sess) return fail('登录已失效，请重新登录', 401);
+    const r = await qRetryAllDue(env, sess.name);
+    return json(r);
+  }
+  const admin = await isQuizAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+  const r = await qRetryAllDue(env, null);
+  return json(r);
+}
+
 /* ---------- 我的考试记录（普通用户看自己的） ---------- */
 async function handleQMySubs(req, env) {
   const bad = assertSameOrigin(req, env);
@@ -1516,7 +1655,10 @@ async function handleQMySubDetail(req, env, subId) {
       id: rec.id, board: rec.board, boardName: rec.boardName, at: rec.at,
       usedMs: rec.usedMs, score: rec.finalScore, total: rec.totalScore,
       confidence: rec.confidence, status: rec.status,
-      shortCount: rec.shortCount || 0, shortMax: rec.shortMax || 0
+      shortCount: rec.shortCount || 0, shortMax: rec.shortMax || 0,
+      /* ★ 没判出来的题 + 重判时间，前端要显示「5 小时后自动重判」 */
+      pendingAi: Array.isArray(rec.pendingAi) ? rec.pendingAi : [],
+      retryAt: rec.retryAt || 0
     },
     detail: detail
   });
@@ -3132,6 +3274,8 @@ async function route(req, env) {
     if (p === '/api/q/session')  return withJson(await handleQSession(req, env), req, env);
     if (p === '/api/q/whereami') return withJson(await handleQWhereami(req, env), req, env);
     if (p === '/api/q/notices')  return withJson(await handleQNotices(req, env), req, env);
+    if (p === '/api/q/retry-mine') return withJson(await handleQRetryGrading(req, env, true), req, env);
+    if (p === '/api/q/admin/retry-grading') return withJson(await handleQRetryGrading(req, env, false), req, env);
     if (p === '/api/q/submit')   return withJson(await handleQSubmit(req, env), req, env);
     if (p === '/api/q/grade-one') return withJson(await handleQGradeOne(req, env), req, env);
     if (p === '/api/q/finish')  return withJson(await handleQFinish(req, env), req, env);
@@ -3223,4 +3367,5 @@ function withJson(resp, req, env) {
 }
 
 export { route, kUser, kName, kSess, kIp, kUid, kLock,
-         makeToken, verifyToken, TTL_SESSION, TTL_GUEST };
+         makeToken, verifyToken, TTL_SESSION, TTL_GUEST,
+         qRetryAllDue };
