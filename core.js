@@ -1300,6 +1300,40 @@ async function handleQSubmissions(req, env, path, subId) {
   return json({ ok: true, rows: rows });
 }
 
+/* DELETE /api/q/submissions/:id —— 删掉一条考试记录（误交 / 重复的卷子） */
+async function handleQSubDelete(req, env, subId) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isQuizAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+
+  const key = 'q:sub:' + subId;
+  const rec = await env.KV.get(key, 'json');
+  if (!rec) return fail('考试记录不存在', 404);
+
+  /* 每道题的 AI 判定是独立 key，要一并删掉 */
+  const qb = await qLoadQbank(env);
+  const board = qFindBoard(qb, rec.board);
+  for (const q of ((board && board.questions) || [])) {
+    try { await env.KV.delete(qAiKey(subId, q.id)); } catch (e) { /* 忽略 */ }
+  }
+  await env.KV.delete(key);
+
+  /* 答题人自己的成绩记录里也摘掉这一条 */
+  try {
+    const sk = qState(rec.name);
+    const cur = (await env.KV.get(sk, 'json')) || {};
+    const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
+    if (Array.isArray(st.exams)) {
+      st.exams = st.exams.filter(function (e) { return e.subId !== subId; });
+      await env.KV.put(sk, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
+        { expirationTtl: 60 * 60 * 24 * 365 });
+    }
+  } catch (e) { /* 忽略 */ }
+
+  return json({ ok: true, id: subId, name: rec.name });
+}
+
 /* POST /api/q/submissions/:id/review —— 管理员逐题确认/改分后提交 */
 async function handleQReview(req, env, subId) {
   const bad = assertSameOrigin(req, env);
@@ -3067,6 +3101,9 @@ async function route(req, env) {
       const sid = decodeURIComponent(p.replace('/api/q/submissions/', ''));
       if (req.method === 'POST' && sid.endsWith('/review')) {
         return withJson(await handleQReview(req, env, sid.replace(/\/review$/, '')), req, env);
+      }
+      if (req.method === 'DELETE') {
+        return withJson(await handleQSubDelete(req, env, sid), req, env);
       }
       return withJson(await handleQSubmissions(req, env, p, sid), req, env);
     }
