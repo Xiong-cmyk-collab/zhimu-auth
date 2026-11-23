@@ -7,3 +7,6 @@
  * 真正的逻辑在 ../deno/main.js（读环境变量、连 KV、起服务）。
  * ===================================================================== */
 import '../deno/main.js';
+/* ★ Deno Deploy 的 cron 任务要求**入口模块**导出同名函数。
+   任务名 retrygrading（deno.json 里的 "cron"）→ 这里必须 export 出去。 */
+export { retrygrading } from '../deno/main.js';
