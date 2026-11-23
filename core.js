@@ -1469,12 +1469,15 @@ async function handleQSubDelete(req, env, subId) {
   const rec = await env.KV.get(key, 'json');
   if (!rec) return fail('考试记录不存在', 404);
 
-  /* 每道题的 AI 判定是独立 key，要一并删掉 */
+  /* 每道题的 AI 判定是独立 key，要一并删掉。
+     ★ 必须**并行**删：100 道题串行 delete 实测要 6 秒多，
+       前端等得以为没删掉（列表不刷新）。 */
   const qb = await qLoadQbank(env);
   const board = qFindBoard(qb, rec.board);
-  for (const q of ((board && board.questions) || [])) {
-    try { await env.KV.delete(qAiKey(subId, q.id)); } catch (e) { /* 忽略 */ }
-  }
+  const dels = ((board && board.questions) || []).map(function (q) {
+    return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
+  });
+  await Promise.all(dels);
   await env.KV.delete(key);
 
   /* 答题人自己的成绩记录里也摘掉这一条 */
