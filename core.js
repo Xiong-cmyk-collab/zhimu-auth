@@ -622,6 +622,10 @@ const qIp = (ip) => `q:ip:${encodeURIComponent(ip || 'unknown')}`;
    为什么不能只靠 IP：手机走 4G/5G，运营商 CGNAT 的出口 IP 经常变；
    而 Deno Deploy 干脆连 IP 都给不出来。所以免密改成认「这台设备」。 */
 const qDev = (did) => `q:dev:${encodeURIComponent(String(did || '').slice(0, 64))}`;
+/* ★ 答题站的拥有者：**有且只有这 2 个，固定不可转让**（2026-11-23 用户要求）。
+   拥有者 = 管理员的全部权利 + 「把普通用户提升为管理员」这一条。
+   通过注册只能成为普通用户 —— 注册处理器里 role 写死 'user'。 */
+const QUIZ_OWNERS = ['ZM1', 'ZM2'];
 const qUid = (n) => `q:uid:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 const qState = (n) => `q:state:${encodeURIComponent(String(n).trim().toLowerCase())}`;
 /* ★ 锁按「IP + 账号」计，不再按 IP 一把大锁。
@@ -669,13 +673,33 @@ async function getQuizSession(req, env, tokenOverride) {
   return s;
 }
 
-/** 答题站管理员：只有 admin 一种角色（没有 owner） */
+/** 答题站管理员：admin 或 owner 都算（owner 拥有管理员的全部权利） */
 async function isQuizAdmin(req, env) {
   const s = await getQuizSession(req, env);
   if (!s) return null;
   const id = await env.KV.get(qName(s.name), 'json');
   const u = id ? await env.KV.get(qUser(id), 'json') : null;
-  return u && u.enabled && u.role === 'admin' ? u : null;
+  return u && u.enabled && (u.role === 'admin' || u.role === 'owner') ? u : null;
+}
+
+/** 答题站拥有者：只有 ZM1 / ZM2 */
+async function isQuizOwner(req, env) {
+  const s = await getQuizSession(req, env);
+  if (!s) return null;
+  const id = await env.KV.get(qName(s.name), 'json');
+  const u = id ? await env.KV.get(qUser(id), 'json') : null;
+  return u && u.enabled && u.role === 'owner' ? u : null;
+}
+
+/** 是否已经存在拥有者（用来限制 setup 只有拥有者能调） */
+async function hasQuizOwner(env) {
+  for (const nm of QUIZ_OWNERS) {
+    const id = await env.KV.get(qName(nm), 'json');
+    if (!id) continue;
+    const u = await env.KV.get(qUser(id), 'json');
+    if (u && u.enabled && u.role === 'owner') return true;
+  }
+  return false;
 }
 
 async function qIssueSession(env, u, req, did) {
@@ -1188,7 +1212,13 @@ async function handleQAdminUsers(req, env, path) {
     let revoke = false;
     if (typeof b.enabled === 'boolean') u.enabled = b.enabled;
     if (b.role) {
-      /* 答题站只有 admin / user 两种角色 */
+      /* ★ 角色变更**只有拥有者**能做（2026-11-23）。
+         拥有者身份固定（ZM1 / ZM2，有且只有 2 个）：
+           既不能被降级成管理员，也不能把 owner 转给别人。 */
+      if (admin.role !== 'owner') return fail('只有拥有者可以调整管理员身份', 403);
+      if (u.role === 'owner' || QUIZ_OWNERS.indexOf(u.name) >= 0) {
+        return fail('拥有者身份固定，不能修改', 403);
+      }
       u.role = (b.role === 'admin') ? 'admin' : 'user';
     }
     if (b.pwd) {
@@ -1333,6 +1363,12 @@ async function handleQAdminSetup(req, env) {
   if (bad) return bad;
   const admin = await isQuizAdmin(req, env);
   if (!admin) return fail('需要管理员权限', 403);
+  /* ★ 一旦存在拥有者，setup 就**只有拥有者能调** ——
+     否则普通管理员能重置 ZM1/ZM2 的密码 → 直接拿到拥有者权限（提权漏洞）。
+     没有任何拥有者时（首次初始化）管理员也能调，用于把 ZM1/ZM2 升为拥有者。 */
+  if (await hasQuizOwner(env) && admin.role !== 'owner') {
+    return fail('只有拥有者可以执行初始化', 403);
+  }
   if (req.method !== 'POST') return fail('仅支持 POST', 405);
   let b;
   try { b = await req.json(); } catch (e) { return fail('请求体不是合法 JSON'); }
@@ -1345,7 +1381,8 @@ async function handleQAdminSetup(req, env) {
     if (id) {
       const u = await env.KV.get(qUser(id), 'json');
       if (!u) continue;
-      u.pwd = hash; u.salt = salt; u.role = 'admin'; u.enabled = true;
+      /* ★ ZM1 / ZM2 是固定的两个拥有者 */
+      u.pwd = hash; u.salt = salt; u.role = 'owner'; u.enabled = true;
       u.pwdAt = Date.now(); u.updAt = Date.now();
       await env.KV.put(qUser(id), JSON.stringify(u));
       updated.push(a.name);
