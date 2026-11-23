@@ -1543,6 +1543,25 @@ async function qAfterGrading(env, rec, board) {
     '#/');
 }
 
+/* 这道题考生**有没有作答**（答题卡里「白」的判定）。
+   ★ 填空题：有一空填了就算「答了」→ 没答全 = 答错（红），不是没答（白）。
+     简答题：写了内容才算答了。选择题：选了才算。 */
+function qAnswered(rec, q) {
+  const a = (rec.auto && rec.auto[q.id]) || null;
+  if (q.type === 'short') {
+    const v = rec.answers ? rec.answers[q.id] : '';
+    return !!(typeof v === 'string' ? v.trim() : v);
+  }
+  if (q.type === 'fill') {
+    const blanks = (a && Array.isArray(a.blanks)) ? a.blanks : (q.blanks || []);
+    for (const b of blanks) {
+      if (b && b.user != null && String(b.user).trim()) return true;
+    }
+    return false;
+  }
+  return !!(a && typeof a.pick === 'number' && a.pick >= 0);
+}
+
 /* ---------- 复核相关 ---------- */
 async function handleQSubmissions(req, env, path, subId) {
   const bad = assertSameOrigin(req, env);
@@ -1582,6 +1601,22 @@ async function handleQSubmissions(req, env, path, subId) {
           user: r.answers ? r.answers[q.id] : '',
           auto: (r.auto && r.auto[q.id]) || null,
           ai: aiAll[q.id] || null,
+          /* ★ 每题最终得分 + 有没有作答 ——
+             答题卡的红/绿/白就靠这两个字段（用户 2026-11-24 要求）。
+             perQ 是交卷时汇总的那一份；万一没走到 finish（考生中途关了页面），
+             就退回 auto（选择/填空）或 AI 判定（简答）。 */
+          final: (r.perQ && r.perQ[q.id] && typeof r.perQ[q.id].score === 'number')
+            ? r.perQ[q.id].score
+            : (q.type === 'short'
+              ? ((aiAll[q.id] && typeof aiAll[q.id].score === 'number') ? aiAll[q.id].score : null)
+              : ((r.auto && r.auto[q.id] && typeof r.auto[q.id].score === 'number') ? r.auto[q.id].score : null)),
+          max: q.score || 0,
+          answered: qAnswered(r, q),
+          /* ★ pick：考生选了第几项。
+             答题卡/全卷里要标出「他选的是哪个」，
+             只给 auto 的话前端读不到顶层 pick，标记就出不来。 */
+          pick: (r.auto && r.auto[q.id] && typeof r.auto[q.id].pick === 'number'
+            && r.auto[q.id].pick >= 0) ? r.auto[q.id].pick : null,
           /* ★ 每题的可信度：填空题用规则判的 conf，简答题用 AI 的 confidence */
           conf: q.type === 'short'
             ? ((aiAll[q.id] && typeof aiAll[q.id].confidence === 'number') ? aiAll[q.id].confidence : null)
@@ -1942,8 +1977,15 @@ async function handleQMySubDetail(req, env, subId) {
         ? ((g && typeof g.confidence === 'number') ? g.confidence : null)
         : ((a && typeof a.conf === 'number') ? a.conf : null),
       user: rec.answers ? rec.answers[q.id] : '',
-      final: fin ? fin.score : null,
+      /* ★ 跟管理员那边同一口径：没走到 finish 时退回 auto（选择/填空）或 AI（简答），
+         免得答题卡上全是「没判分」的中性色。 */
+      final: fin ? fin.score
+        : (q.type === 'short'
+          ? ((g && typeof g.score === 'number') ? g.score : null)
+          : ((a && typeof a.score === 'number') ? a.score : null)),
       max: q.score || 0,
+      /* ★ 有没有作答：答题卡里「白」的判定（用户 2026-11-24 要求） */
+      answered: qAnswered(rec, q),
       options: q.options || null,
       answer: (typeof q.answer === 'number') ? q.answer : null,
       reference: q.reference || null,
