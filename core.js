@@ -1854,8 +1854,16 @@ async function handleQNotices(req, env) {
   const key = qNotice(sess.name);
   const arr = (await env.KV.get(key, 'json')) || [];
 
-  /* DELETE：清空我的通知 */
+  /* DELETE：{ids:[...]} 删掉指定的几条；不传 ids = 清空全部 */
   if (req.method === 'DELETE') {
+    let b = {};
+    try { b = await qReadBody(req); } catch (e) { b = {}; }
+    const ids = Array.isArray(b.ids) ? b.ids.map(function (x) { return String(x); }) : null;
+    if (ids && ids.length) {
+      const keep = arr.filter(function (n) { return ids.indexOf(String(n.id)) < 0; });
+      await env.KV.put(key, JSON.stringify(keep), { expirationTtl: NOTICE_TTL });
+      return json({ ok: true, removed: arr.length - keep.length, left: keep.length });
+    }
     await env.KV.put(key, '[]', { expirationTtl: NOTICE_TTL });
     return json({ ok: true, cleared: arr.length });
   }
