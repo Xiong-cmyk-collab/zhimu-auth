@@ -2039,6 +2039,20 @@ async function handleQAdminConfig(req, env, what) {
   let b;
   try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
 
+  /* GET /api/q/admin/aicfg —— 只回 base / model / 有没有密钥，
+     **绝不回传 key 本身**（密钥只留在服务器 KV 里）。
+     用途：管理后台显示当前配置 + 出问题时能准确改回去。 */
+  if (what === 'aicfg' && req.method === 'GET') {
+    let prev = null;
+    try { prev = await env.KV.get(Q_AICFG, 'json'); } catch (e) { prev = null; }
+    prev = prev || {};
+    return json({
+      ok: true, hasKey: !!prev.key,
+      base: prev.base || 'https://api.minimaxi.com/v1/chat/completions',
+      model: prev.model || 'MiniMax-M3.1-Flash'
+    });
+  }
+
   if (what === 'qbank') {
     if (!b || !Array.isArray(b.boards)) return fail('缺少 boards');
     const rec = { version: String(b.version || ''), boards: b.boards, at: Date.now() };
