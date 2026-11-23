@@ -2036,12 +2036,12 @@ async function handleQAdminConfig(req, env, what) {
   if (bad) return bad;
   const owner = await isQuizOwner(req, env);
   if (!owner) return fail('只有拥有者可以执行', 403);
-  let b;
-  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
 
   /* GET /api/q/admin/aicfg —— 只回 base / model / 有没有密钥，
      **绝不回传 key 本身**（密钥只留在服务器 KV 里）。
-     用途：管理后台显示当前配置 + 出问题时能准确改回去。 */
+     用途：管理后台显示当前配置 + 出问题时能准确改回去。
+     ★ 必须放在「读请求体」**前面** —— GET 没有请求体，
+       先解析会直接报「请求体不是合法 JSON」。 */
   if (what === 'aicfg' && req.method === 'GET') {
     let prev = null;
     try { prev = await env.KV.get(Q_AICFG, 'json'); } catch (e) { prev = null; }
@@ -2052,6 +2052,9 @@ async function handleQAdminConfig(req, env, what) {
       model: prev.model || 'MiniMax-M3.1-Flash'
     });
   }
+
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
 
   if (what === 'qbank') {
     if (!b || !Array.isArray(b.boards)) return fail('缺少 boards');
