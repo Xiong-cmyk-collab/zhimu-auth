@@ -1642,7 +1642,10 @@ async function handleQMySubDetail(req, env, subId) {
     }
     if (q.type === 'short' && g) {
       item.ai = { score: g.score, max: g.max, hits: g.hits || [],
-        confidence: g.confidence, reason: g.reason, needManual: !!g.needManual };
+        confidence: g.confidence, reason: g.reason, needManual: !!g.needManual,
+        /* ★ pending=true = AI **没判出来**（服务不可用/超时/解析失败）。
+           它跟「判了但判成 0 分」是两回事，界面必须分开显示。 */
+        pending: !!g.pending };
       /* 得分点的文字也要打码 —— 只给编号，文字是答案的一部分 */
       item.hitCount = (g.hits || []).length;
       item.pointCount = Array.isArray(q.points) ? q.points.length : 0;
