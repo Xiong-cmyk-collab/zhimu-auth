@@ -863,24 +863,47 @@ async function qAiGradeShort(env, q, userAnswer) {
     '4. confidence 是你对本次判断的把握程度（0 到 1）。'
   ].join('\n');
 
-  try {
+  const body = JSON.stringify({
+    model: cfg.model,
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.1,
+    stream: false
+  });
+  /* ★ 模型端点会限流（HTTP 429）。一次撞上就整道判 0 分太亏，
+     退避重试两次再放弃。等待不占 CPU，墙钟时间无所谓。 */
+  const BACKOFF = [1500, 3500];
+  let r = null;
+  let lastStatus = 0;
+  for (let attempt = 0; attempt <= BACKOFF.length; attempt++) {
     const ctrl = new AbortController();
     const timer = setTimeout(function () { ctrl.abort(); }, 25000);
-    const r = await fetch(cfg.base, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.1,
-        stream: false
-      }),
-      signal: ctrl.signal
-    });
+    try {
+      r = await fetch(cfg.base, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key },
+        body: body,
+        signal: ctrl.signal
+      });
+    } catch (e) {
+      r = null;
+      lastStatus = (e && e.name === 'AbortError') ? 'timeout' : 'neterr';
+    }
     clearTimeout(timer);
-    if (!r.ok) {
-      return { score: 0, max: max, hits: [], confidence: 0,
-        reason: '模型返回 HTTP ' + r.status, needManual: true };
+    if (r && r.ok) break;
+    lastStatus = r ? r.status : lastStatus;
+    /* 只有 429 / 5xx 值得重试；4xx 的其它错误重试也没用 */
+    if (!(lastStatus === 429 || (typeof lastStatus === 'number' && lastStatus >= 500))) break;
+    if (attempt < BACKOFF.length) {
+      await new Promise(function (rs) { setTimeout(rs, BACKOFF[attempt]); });
+    }
+  }
+  try {
+    if (!r || !r.ok) {
+      const why = (lastStatus === 429)
+        ? '模型繁忙（限流），这道题请人工判分'
+        : (lastStatus === 'timeout' ? '判分超时，请人工判分'
+          : (lastStatus === 'neterr' ? '网络异常，请人工判分' : '模型返回 HTTP ' + lastStatus));
+      return { score: 0, max: max, hits: [], confidence: 0, reason: why, needManual: true };
     }
     const j = await r.json();
     const raw = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
