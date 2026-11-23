@@ -2441,6 +2441,9 @@ function sanitizeQuizState(st) {
   const out = { wrong: {}, progress: {}, exams: [], best: {} };
   const str = (v, n) => String(v == null ? '' : v).replace(/[\x00-\x1F]/g, '').slice(0, n);
 
+  /* ★ wrongResetAt：错题本被「一次性清空」的时刻。
+     客户端拿它跟自己记住的比 —— 服务端更新了就说明本机缓存的错题已作废。 */
+  out.wrongResetAt = Number(st.wrongResetAt) || 0;
   if (st.wrong && typeof st.wrong === 'object') {
     let n = 0;
     for (const qid of Object.keys(st.wrong)) {
@@ -2632,6 +2635,45 @@ async function handleQQuizState(req, env) {
     return json({ ok: true, saved: true, dropped: dropped });
   }
   return json({ ok: false, error: 'method_not_allowed' }, 405);
+}
+
+/* POST /api/q/admin/wrong-reset —— **一次性**清空所有账号的错题本。
+   ★ 用户 2026-11-24 明确授权：「这一次你把错题本全部清空……仅这一次」。
+   ★ 用完即废：执行成功后写标志进 KV，再调直接 404 ——
+     不留「一键清空」的后门（用户一直反对这类批量清除能力）。
+   ★ 同时写 wrongResetAt：客户端据此把**本机缓存**的错题也作废，
+     否则清完服务器，本机一同步又推回去。 */
+async function handleQWrongReset(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const owner = await isQuizOwner(req, env);
+  if (!owner) return fail('需要拥有者权限', 403);
+  const flag = await env.KV.get('q:cfg:wrong-reset-once', 'json');
+  if (flag && flag.done) return fail('该一次性操作已执行过', 404);
+  let b = {};
+  try { b = await qReadBody(req); } catch (e) { b = {}; }
+  if (String(b.token || '') !== 'WONGRESET-20261124') return fail('口令不对', 403);
+
+  const users = await env.KV.list({ prefix: 'q:user:' });
+  const at = Date.now();
+  let accounts = 0, questions = 0;
+  for (const k of users.keys) {
+    const u = await env.KV.get(k.name, 'json');
+    if (!u || !u.name) continue;
+    const sk = qState(u.name);
+    const rec = await env.KV.get(sk, 'json');
+    const st = (rec && rec.state && typeof rec.state === 'object') ? rec.state : null;
+    if (!st) continue;
+    if (st.wrong) questions += Object.keys(st.wrong).length;
+    st.wrong = {};
+    st.wrongResetAt = at;
+    accounts++;
+    await env.KV.put(sk, JSON.stringify({ state: st, name: u.name, at: at }),
+      { expirationTtl: 60 * 60 * 24 * 365 });
+  }
+  await env.KV.put('q:cfg:wrong-reset-once',
+    JSON.stringify({ done: true, at: at, accounts: accounts, questions: questions }));
+  return json({ ok: true, accounts: accounts, questions: questions, at: at });
 }
 
 /* ---------- 答题站：全员答题数据 ---------- */
@@ -3839,6 +3881,7 @@ async function route(req, env) {
       }
       return withJson(await handleQSubmissions(req, env, p, sid), req, env);
     }
+    if (p === '/api/q/admin/wrong-reset') return withJson(await handleQWrongReset(req, env), req, env);
     if (p === '/api/q/admin/qbank') return withJson(await handleQAdminConfig(req, env, 'qbank'), req, env);
     if (p === '/api/q/admin/aicfg') return withJson(await handleQAdminConfig(req, env, 'aicfg'), req, env);
     if (p === '/api/q/ping')     return withJson(await handleQPing(req, env), req, env);
