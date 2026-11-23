@@ -781,7 +781,10 @@ async function qModelConfig(env) {
 
 /* ---------- 填空题：规范化比对 ---------- */
 function qNormText(s) {
-  return String(s == null ? '' : s)
+  /* ★ 注意：原来是 `return String(...).replace(...)` —— 直接 return，
+     后面再补归一就是**死代码**（return 之后不执行）。
+     现在改成先赋值 t，再做归一，最后 return。 */
+  let t = String(s == null ? '' : s)
     .replace(/[\s\u3000]/g, '')                 /* 去掉所有空白（含全角空格） */
     .replace(/[（]/g, '(').replace(/[）]/g, ')')
     .replace(/[，]/g, ',').replace(/[。]/g, '.')
@@ -792,7 +795,42 @@ function qNormText(s) {
     .replace(/[×✕✖]/g, 'x')
     .replace(/[°]/g, '')
     .toLowerCase();
+  /* ★ 单位别名：中文单位写法差异（「伏」vs「V」）。
+     不归一的话，数值近似分支会因为文字不同而判错。 */
+  for (const pair of Q_UNIT_ALIAS) {
+    if (t.indexOf(pair[0]) >= 0) t = t.split(pair[0]).join(pair[1]);
+  }
+  /* ★ 中文数字 → 阿拉伯数字（**整串**是中文数字才转）。
+     标准答案写「三」、考生写「3」，以前判错，现在对。 */
+  const cn = qCnNum(t);
+  if (cn !== null) t = cn;
+  return t;
 }
+
+/* 中文数字 → 阿拉伯数字。整串是中文数字才转；不是就返回 null。
+   「三」→3 「十」→10 「十一」→11 「二十」→20 「三十」→30 */
+const Q_CN_DIGIT = { '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+const Q_CN_UNIT = { '十': 10, '百': 100, '千': 1000 };
+function qCnNum(s) {
+  if (!/^[零一二两三四五六七八九十百千]+$/.test(s)) return null;
+  let total = 0, section = 0, num = 0;
+  for (const ch of s) {
+    if (Q_CN_DIGIT[ch] !== undefined) { num = Q_CN_DIGIT[ch]; continue; }
+    if (Q_CN_UNIT[ch] !== undefined) { section += (num || 1) * Q_CN_UNIT[ch]; num = 0; continue; }
+    return null;
+  }
+  return String(total + section + num);
+}
+
+/* 中文单位 → 英文/符号写法（归一用） */
+const Q_UNIT_ALIAS = [
+  ['伏特', 'v'], ['伏', 'v'],
+  ['瓦特', 'w'], ['瓦', 'w'],
+  ['赫兹', 'hz'], ['赫', 'hz'],
+  ['毫安', 'ma'], ['安培', 'a'],
+  ['欧姆', 'ohm'],
+  ['毫米', 'mm'], ['厘米', 'cm'], ['千米', 'km']
+];
 /* 同义词表：标准答案 → 其它可接受的写法（规范化后比较） */
 const Q_ANSWER_ALIAS = {
   'stm32g474ret6': ['stm32g474'],
@@ -819,7 +857,11 @@ function qFillMatch(std, user) {
   if (a === b) return { hit: true, conf: 1, how: '精确匹配' };
   const alias = Q_ANSWER_ALIAS[a];
   if (alias && alias.indexOf(b) >= 0) return { hit: true, conf: 1, how: '同义词命中' };
-  /* 数字近似：两边数字个数相同且逐个相对误差 ≤1% */
+  /* 数字近似：两边数字个数相同且逐个相对误差 ≤1%
+     ★★ **去掉数字后的文字必须完全相等** —— 只比数字的话，
+       「TELEM1」和「CAN 1」会判成命中（数字都是 1）→ 白送分。
+       2026-11-24 实测踩到过：标准答案 TELEM1，考生写 CAN 1，直接拿了满分。
+       单位写法差异（「伏」vs「V」）在 qNormText 里已归一，不靠这条兜。 */
   const na = a.match(/-?\d+(?:\.\d+)?/g), nb = b.match(/-?\d+(?:\.\d+)?/g);
   if (na && nb && na.length === nb.length && na.length > 0) {
     const ok = na.every(function (x, i) {
@@ -828,7 +870,8 @@ function qFillMatch(std, user) {
       const scale = Math.max(Math.abs(fx), Math.abs(fy));
       return scale > 0 && Math.abs(fx - fy) <= scale * 0.01;
     });
-    if (ok) return { hit: true, conf: 0.95, how: '数值近似' };
+    const stripNum = (x) => x.replace(/-?\d+(?:\.\d+)?/g, '');
+    if (ok && stripNum(a) === stripNum(b)) return { hit: true, conf: 0.95, how: '数值近似' };
   }
   return { hit: false, conf: 0.5, how: '不匹配' };
 }
