@@ -890,8 +890,11 @@ async function qAiGradeShort(env, q, userAnswer) {
     return { score: 0, max: max, hits: [], confidence: 0, reason: '题目没有得分点', needManual: true };
   }
   if (!answer) {
-    /* 「未作答」是正常结果，不是判分失败 —— 不用重判 */
-    return { score: 0, max: max, hits: [], confidence: 0, reason: '未作答', needManual: true };
+    /* ★ 未作答 = 该题 0 分（与填空题口径统一）。
+       可信度给 1：系统很确定他没答，判 0 分是可靠的，不用人工再看。
+       graded:false → 整卷可信度不把它算进去（避免一堆没答的题把可信度虚高）。 */
+    return { score: 0, max: max, hits: [], confidence: 1, reason: '未作答',
+      needManual: false, graded: false };
   }
   const cfg = await qModelConfig(env);
   if (!cfg.key) {
@@ -1594,7 +1597,8 @@ async function qRetryOne(env, rec, board, now) {
     let sc = 0;
     if (q.type === 'short') {
       sc = g ? g.score : 0;
-      if (g) { confSum += g.confidence; confN++; }
+      /* 只对 AI 真正判过的题取平均（未作答的不算） */
+      if (g && g.graded !== false) { confSum += g.confidence; confN++; }
     } else if (a) sc = a.score;
     perQ[q.id] = { score: sc, max: q.score || 0 };
     score += sc;
