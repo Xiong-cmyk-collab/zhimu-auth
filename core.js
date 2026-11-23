@@ -1384,6 +1384,91 @@ async function qUserNames(env) {
   return out;
 }
 
+/* 从一份考试记录算出「这道卷子错了哪些题」。
+   ★ 口径必须跟前端 markWrong 一致：
+     - 选择题：**未作答不算错**（前端只在 picked != null && picked !== answer 时 markWrong）
+     - 填空题：整题计分，0 分就是没答全 → 算错
+     - 简答题：没拿满分 → 算错（但简答/填空**不进错题本**，前端只对选择题 markWrong） */
+function qComputeWrong(rec, board) {
+  const wrongIds = [], wrongPicks = {};
+  for (const q of ((board && board.questions) || [])) {
+    const a = (rec.auto && rec.auto[q.id]) || null;
+    const pq = (rec.perQ && rec.perQ[q.id]) || null;
+    if (q.type === 'short') {
+      const got = pq ? (Number(pq.score) || 0) : 0;
+      const max = pq ? (Number(pq.max) || 0) : (q.score || 3);
+      if (max > 0 && got < max) wrongIds.push(q.id);
+      continue;
+    }
+    if (q.type === 'fill') {
+      const got = a ? (Number(a.score) || 0) : 0;
+      const max = a ? (Number(a.max) || 0) : (q.score || 0);
+      if (max > 0 && got < max) wrongIds.push(q.id);
+      continue;
+    }
+    /* choice：未作答（pick < 0）不算错 */
+    if (a && a.kind === 'choice' && a.pick >= 0 && !a.right) {
+      wrongIds.push(q.id);
+      wrongPicks[q.id] = a.pick;
+    }
+  }
+  return { wrongIds: wrongIds, wrongPicks: wrongPicks };
+}
+
+/* 删掉一条考试记录后，把「最好成绩」和「错题本」一起同步过去。
+   ★ 原来只删了 exams 里那一条 —— 卡片上还挂着「最好 120/150」「错题 1」，
+     用户看到的就是「记录删了、数据还在」（用户反馈：不会同步更新）。 */
+function qSyncAfterExamRemoved(st, rec, board) {
+  if (!st || !rec) return;
+  /* 1) 最好成绩：只有被删的这条**正是**该板块的最佳成绩时才重算。
+        （不无条件重算 —— exams 是滚动窗口，外面可能还有更早的历史最好。） */
+  const boardId = rec.board;
+  const ob = st.best && st.best[boardId];
+  if (ob && (Number(ob.score) || 0) === (Number(rec.finalScore) || 0)) {
+    let nb = null;
+    for (const e of (st.exams || [])) {
+      if (!e || e.board !== boardId) continue;
+      if (!nb || (Number(e.score) || 0) > (Number(nb.score) || 0)) {
+        nb = { score: Number(e.score) || 0, total: Number(e.total) || 0, at: Number(e.at) || 0 };
+      }
+    }
+    st.best = st.best || {};
+    if (nb) st.best[boardId] = nb; else delete st.best[boardId];
+  }
+  /* 2) 错题本：这次考试答错的选择题，次数减 1；减到 0 就删掉。
+        （错题本里只有选择题 —— 练习模式也只对选择题 markWrong。） */
+  if (st.wrong && typeof st.wrong === 'object') {
+    const w = qComputeWrong(rec, board);
+    const choiceIds = {};
+    for (const q of ((board && board.questions) || [])) {
+      if (q.type === 'choice') choiceIds[q.id] = 1;
+    }
+    for (const qid of w.wrongIds) {
+      if (!choiceIds[qid]) continue;
+      const one = st.wrong[qid];
+      if (!one) continue;
+      const t = (Number(one.times) || 1) - 1;
+      if (t <= 0) delete st.wrong[qid]; else one.times = t;
+    }
+  }
+}
+
+/* 清掉「无源之水」的最佳成绩：某个板块**一条考试记录都没有**了，
+   best 里那一项就是残留 —— 它本来只能由考试记录写出来。
+   ★ 判据必须是「一条都没有」而不是「对不上某条记录」：
+     exams 是滚动窗口（上限 100），最早的记录被挤掉后历史最好仍然有效，
+     按「对不上」判断会误删真人的历史最好成绩。 */
+function qCleanOrphanBest(st) {
+  if (!st || !st.best || typeof st.best !== 'object') return;
+  const seen = {};
+  for (const e of (st.exams || [])) {
+    if (e && e.board) seen[e.board] = 1;
+  }
+  for (const bid of Object.keys(st.best)) {
+    if (!seen[bid]) delete st.best[bid];
+  }
+}
+
 /* 判分完成后：写进用户成绩记录 + 通知管理员 + 通知答题人 */
 async function qAfterGrading(env, rec, board) {
   /* 写进用户自己的答题状态（这样「我的考试记录」里能看到） */
@@ -1395,30 +1480,12 @@ async function qAfterGrading(env, rec, board) {
     /* ★ 后端**自己算错题**（以前只写分数、不写错题）。
        少了 wrongIds，后台历史抽屉就显示「全对」、点开什么都没有 ——
        用户反馈「我点了它，没有反应」。 */
-    const wrongIds = [], wrongPicks = {};
-    for (const q of ((board && board.questions) || [])) {
-      const a = (rec.auto && rec.auto[q.id]) || null;
-      const pq = (rec.perQ && rec.perQ[q.id]) || null;
-      let got = 0, max = 0;
-      if (q.type === 'short') {
-        /* 简答题的得分在 perQ 里（auto 里的 short 永远是 0 分） */
-        got = pq ? (Number(pq.score) || 0) : 0;
-        max = pq ? (Number(pq.max) || 0) : (q.score || 3);
-      } else {
-        got = a ? (Number(a.score) || 0) : 0;
-        max = a ? (Number(a.max) || 0) : (q.score || 0);
-      }
-      if (max > 0 && got < max) {
-        wrongIds.push(q.id);
-        /* 只有选择题有「他选了第几项」；填空/简答是文本，记不了 */
-        if (a && a.kind === 'choice' && typeof a.pick === 'number' && a.pick >= 0) wrongPicks[q.id] = a.pick;
-      }
-    }
+    const wrong = qComputeWrong(rec, board);
     const entry = {
       at: rec.at, board: rec.board, boardName: rec.boardName,
       score: rec.finalScore, total: rec.totalScore, usedMs: rec.usedMs,
       subId: rec.id, pending: rec.status === 'pending_review',
-      wrongIds: wrongIds, wrongPicks: wrongPicks
+      wrongIds: wrong.wrongIds, wrongPicks: wrong.wrongPicks
     };
     /* ★ 幂等：同一个 subId **就地更新**，不重复 push。
        原来是无脑 push → 同一次考试（提交时写一次、finish 时又写一次）
@@ -1530,6 +1597,7 @@ async function handleQSubDelete(req, env, subId) {
 
   const key = 'q:sub:' + subId;
   const rec = await env.KV.get(key, 'json');
+  let board = null;
 
   /* ★ 明细可能**已经没了**（删过一次 / 180 天过期），但成绩汇总里还留着这一条。
      原来这里直接 404 → 汇总永远摘不掉 → 后台「考试=1」删了还在，
@@ -1539,7 +1607,7 @@ async function handleQSubDelete(req, env, subId) {
        ★ 必须**并行**删：100 道题串行 delete 实测要 6 秒多，
          前端等得以为没删掉（列表不刷新）。 */
     const qb = await qLoadQbank(env);
-    const board = qFindBoard(qb, rec.board);
+    board = qFindBoard(qb, rec.board);
     const dels = ((board && board.questions) || []).map(function (q) {
       return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
     });
@@ -1561,6 +1629,10 @@ async function handleQSubDelete(req, env, subId) {
         const before = st.exams.length;
         st.exams = st.exams.filter(function (e) { return e.subId !== subId; });
         if (st.exams.length !== before) {
+          /* ★ 记录删了，「最好成绩」和「错题本」也要跟着走 ——
+             否则卡片上还挂着「最好 120/150」「错题 1」，看着像没删干净。 */
+          if (rec && rec.name === nm) qSyncAfterExamRemoved(st, rec, board);
+          qCleanOrphanBest(st);
           cleaned.push(nm);
           await env.KV.put(sk, JSON.stringify({ state: st, name: nm, at: Date.now() }),
             { expirationTtl: 60 * 60 * 24 * 365 });
@@ -1815,6 +1887,10 @@ async function handleQMySubDelete(req, env, subId) {
       const before = st.exams.length;
       st.exams = st.exams.filter(function (e) { return e.subId !== subId; });
       removed = before - st.exams.length;
+      /* ★ 记录删了，「最好成绩」和「错题本」也要跟着走 ——
+         否则卡片上还挂着「最好 120/150」「错题 1」，看着像没删干净。 */
+      if (removed > 0 && rec) qSyncAfterExamRemoved(st, rec, board);
+      qCleanOrphanBest(st);
       await env.KV.put(sk, JSON.stringify({ state: st, name: sess.name, at: Date.now() }),
         { expirationTtl: 60 * 60 * 24 * 365 });
     }
@@ -2400,6 +2476,11 @@ async function handleQQuizState(req, env) {
         clean.exams = merged.slice(-MAX_QUIZ_EXAMS);
       }
     } catch (e) { /* 读不到就按前端的状态写 */ }
+    /* ★ 清掉「无源之水」的最佳成绩：某个板块一条考试记录都没有了，
+       best 里那一项就是残留（best 只能由考试记录写出来）。
+       用户反馈「记录删了，卡片上还挂着最好 120/150」——
+       同步进来时顺手把它清掉，首页卡片才不会继续显示。 */
+    qCleanOrphanBest(clean);
     await env.KV.put(key, JSON.stringify({ state: clean, name: s.name, at: Date.now() }));
     return json({ ok: true, saved: true });
   }
