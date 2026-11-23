@@ -970,7 +970,17 @@ async function qGunzipB64(b64) {
 }
 
 /* ---------- 交卷 / 判分 / 复核 ---------- */
+/* ★ 题库进程内缓存：题库是 gzip 分块存的，每次读都要拉 4 个 KV 块再解压，
+   复核详情页一次要读好几遍（列表、判分、详情），没有缓存要等 3~5 秒。
+   60 秒过期，写题库时立刻失效。 */
+let Q_QBANK_CACHE = null;
+const Q_QBANK_CACHE_MS = 60000;
+
 async function qLoadQbank(env) {
+  const now = Date.now();
+  if (Q_QBANK_CACHE && (now - Q_QBANK_CACHE.at) < Q_QBANK_CACHE_MS) {
+    return Q_QBANK_CACHE.rec;
+  }
   let head = null;
   try { head = await env.KV.get(Q_QBANK, 'json'); } catch (e) { head = null; }
   if (!head || !head.chunks) return null;
@@ -987,7 +997,11 @@ async function qLoadQbank(env) {
   } catch (e) { return null; }
   try {
     const rec = JSON.parse(text);
-    return (rec && rec.boards) ? rec : null;
+    if (rec && rec.boards) {
+      Q_QBANK_CACHE = { at: now, rec: rec };
+      return rec;
+    }
+    return null;
   } catch (e) { return null; }
 }
 function qFindBoard(qb, boardId) {
@@ -1437,6 +1451,8 @@ async function handleQAdminConfig(req, env, what) {
     await env.KV.put(Q_QBANK, JSON.stringify({
       v: 1, codec: codec, chunks: n, size: payload.length, at: Date.now()
     }));
+    /* 题库刚更新 → 缓存立刻失效，下一次读就是新题库 */
+    Q_QBANK_CACHE = null;
     const cnt = b.boards.reduce(function (a, x) { return a + ((x.questions || []).length); }, 0);
     return json({ ok: true, boards: b.boards.length, questions: cnt,
       bytes: payload.length, chunks: n, codec: codec });
