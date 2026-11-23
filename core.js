@@ -1414,7 +1414,12 @@ async function handleQSubmissions(req, env, path, subId) {
           no: q.no, seq: (q.seq != null) ? q.seq : q.no,
           type: q.type, stem: q.stem, score: q.score,
           options: q.options || null, reference: q.reference || null,
-          points: q.points || null, blanks: q.blanks || null,
+          points: q.points || null,
+          /* ★ blanks 要给**考生作答**（含标准答案/填写内容/命中与否/每空可信度），
+             不能给题目的空 —— 给题目的空的话，前端读到的 user/hit/conf 全是空，
+             显示成「考生填：（空）」「未命中」，跟上面的得分自相矛盾。 */
+          blanks: (r.auto && r.auto[q.id] && Array.isArray(r.auto[q.id].blanks))
+            ? r.auto[q.id].blanks : (q.blanks || null),
           /* ★ answer：选择题的正确选项下标。漏了它管理员只能看到
              「对/错」，看不到「正确答案是什么」，没法判断该不该改分。 */
           answer: (typeof q.answer === 'number') ? q.answer : null,
