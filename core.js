@@ -1322,6 +1322,9 @@ async function handleQFinish(req, env) {
       }
     } else if (a) {
       score += a.score;
+      /* ★ 每题分也要记进 perQ —— 只写 short 分支的话，
+        选择题/填空题在用户明细里得分显示成「—」（final=null）。 */
+      perQ[q.id] = { score: a.score, max: q.score || 0 };
     }
   }
   const confidence = confN ? Math.round((confSum / confN) * 100) : 100;
