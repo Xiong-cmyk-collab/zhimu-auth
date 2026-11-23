@@ -627,9 +627,24 @@ const qDev = (did) => `q:dev:${encodeURIComponent(String(did || '').slice(0, 64)
 const Q_QBANK = 'q:qbank';
 /* ★ AI 配置：q:aicfg —— {key, base, model}。API Key 只存在服务端，不进仓库。 */
 const Q_AICFG = 'q:aicfg';
-/* ★ 站内通知：q:notice:<账号名> → 通知数组（最多 20 条，新的在前） */
+/* ★ 站内通知：q:notice:<账号名> → 通知数组（新的在前）
+   ★ 2026-11-23 用户要求：「个人的通知应该要一直存在，就除非是自己手动删除」
+     → ① **不设过期**：Deno KV 的 put 不传 expirationTtl 就是永久保留
+       ② 条数上限从 20 提到 100（原来新通知会把最老的挤掉）
+       ③ 标已读 / 删通知时都会重写一次（KV 上没有过期时间，所以不会自然消失） */
 const qNotice = (name) => `q:notice:${encodeURIComponent(String(name || '').trim().toLowerCase())}`;
-const NOTICE_TTL = 60 * 60 * 24 * 30;   /* 通知留 30 天 */
+const NOTICE_MAX = 100;          /* 最多存多少条（新的在前） */
+
+/* 写通知数组：不设过期（永久保留），并按字节兜底别撑爆 KV 单值 64 KB */
+async function qNoticePut(env, key, arr) {
+  const keep = arr.slice(0, NOTICE_MAX);
+  let s = JSON.stringify(keep);
+  while (keep.length > 1 && s.length > 48000) {
+    keep = keep.slice(0, keep.length - 1);
+    s = JSON.stringify(keep);
+  }
+  await env.KV.put(key, s);
+}
 /* ★ 答题站的拥有者：**有且只有这 2 个，固定不可转让**（2026-11-23 用户要求）。
    拥有者 = 管理员的全部权利 + 「把普通用户提升为管理员」这一条。
    通过注册只能成为普通用户 —— 注册处理器里 role 写死 'user'。 */
@@ -1052,7 +1067,7 @@ async function qNotify(env, name, type, title, body, link, who) {
       at: Date.now(),
       read: false
     });
-    await env.KV.put(key, JSON.stringify(arr.slice(0, 20)), { expirationTtl: NOTICE_TTL });
+    await qNoticePut(env, key, arr);
   } catch (e) {
     /* 通知写失败就忽略 */
   }
@@ -1859,10 +1874,10 @@ async function handleQNotices(req, env) {
     const ids = Array.isArray(b.ids) ? b.ids.map(function (x) { return String(x); }) : null;
     if (ids && ids.length) {
       const keep = arr.filter(function (n) { return ids.indexOf(String(n.id)) < 0; });
-      await env.KV.put(key, JSON.stringify(keep), { expirationTtl: NOTICE_TTL });
+      await qNoticePut(env, key, keep);
       return json({ ok: true, removed: arr.length - keep.length, left: keep.length });
     }
-    await env.KV.put(key, '[]', { expirationTtl: NOTICE_TTL });
+    await qNoticePut(env, key, []);
     return json({ ok: true, cleared: arr.length });
   }
 
@@ -1873,12 +1888,12 @@ async function handleQNotices(req, env) {
     for (const n of arr) {
       if (!n.read && (!ids || ids.indexOf(String(n.id)) >= 0)) n.read = true;
     }
-    await env.KV.put(key, JSON.stringify(arr), { expirationTtl: NOTICE_TTL });
+    await qNoticePut(env, key, arr);
     return json({ ok: true, unread: 0 });
   }
 
   const unread = arr.filter(n => !n.read).length;
-  return json({ ok: true, notices: arr.slice(0, 20), unread: unread });
+  return json({ ok: true, notices: arr.slice(0, NOTICE_MAX), unread: unread });
 }
 
 async function qPurgeSessions(env, name) {
