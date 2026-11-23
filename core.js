@@ -622,6 +622,14 @@ const qIp = (ip) => `q:ip:${encodeURIComponent(ip || 'unknown')}`;
    为什么不能只靠 IP：手机走 4G/5G，运营商 CGNAT 的出口 IP 经常变；
    而 Deno Deploy 干脆连 IP 都给不出来。所以免密改成认「这台设备」。 */
 const qDev = (did) => `q:dev:${encodeURIComponent(String(did || '').slice(0, 64))}`;
+/* ★ 后端题库：q:qbank —— 判分用的权威题目+标准答案+得分点。
+   ★ 判分绝不能信前端传上来的标准答案（能被篡改成满分），所以题目必须存服务端。 */
+const Q_QBANK = 'q:qbank';
+/* ★ AI 配置：q:aicfg —— {key, base, model}。API Key 只存在服务端，不进仓库。 */
+const Q_AICFG = 'q:aicfg';
+/* ★ 站内通知：q:notice:<账号名> → 通知数组（最多 20 条，新的在前） */
+const qNotice = (name) => `q:notice:${encodeURIComponent(String(name || '').trim().toLowerCase())}`;
+const NOTICE_TTL = 60 * 60 * 24 * 30;   /* 通知留 30 天 */
 /* ★ 答题站的拥有者：**有且只有这 2 个，固定不可转让**（2026-11-23 用户要求）。
    拥有者 = 管理员的全部权利 + 「把普通用户提升为管理员」这一条。
    通过注册只能成为普通用户 —— 注册处理器里 role 写死 'user'。 */
@@ -739,6 +747,670 @@ async function qIssueSession(env, u, req, did) {
     }
   }
   return { token: tk, expireAt: expAt };
+}
+
+/* ---------- AI 配置：KV 优先，其次环境变量 ---------- */
+async function qModelConfig(env) {
+  let rec = null;
+  try { rec = await env.KV.get(Q_AICFG, 'json'); } catch (e) { rec = null; }
+  rec = rec || {};
+  return {
+    key: rec.key || env.MODEL_API_KEY || '',
+    /* ★ 默认用**新的** OpenAI 兼容端点：旧的 api.minimax.chat/v1/text/chatcompletion_v2
+       已废弃（M2 / abab6.5-chat / MiniMax-Text-01 全部下线），现在报
+       "The model X is no longer available"。国内基址 api.minimaxi.com。 */
+    base: rec.base || 'https://api.minimaxi.com/v1/chat/completions',
+    model: rec.model || 'MiniMax-M3.1-Flash'
+  };
+}
+
+/* ---------- 填空题：规范化比对 ---------- */
+function qNormText(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\s\u3000]/g, '')                 /* 去掉所有空白（含全角空格） */
+    .replace(/[（]/g, '(').replace(/[）]/g, ')')
+    .replace(/[，]/g, ',').replace(/[。]/g, '.')
+    .replace(/[：]/g, ':').replace(/[；]/g, ';')
+    .replace(/[：]/g, ':')
+    .replace(/[～]/g, '-').replace(/~/g, '-')
+    .replace(/[－—–−]/g, '-')                     /* 各种横线统一 */
+    .replace(/[×✕✖]/g, 'x')
+    .replace(/[°]/g, '')
+    .toLowerCase();
+}
+/* 同义词表：标准答案 → 其它可接受的写法（规范化后比较） */
+const Q_ANSWER_ALIAS = {
+  'stm32g474ret6': ['stm32g474'],
+  '4.75-5.25v': ['4.75-5.25', '4.75~5.25'],
+  '4.7-5.2v': ['4.7-5.2', '4.7~5.2'],
+  '0.5-1.0m': ['0.5-1.0', '0.5m-1.0m', '0.5-1.0m'],
+  '62.70x17.80mm': ['62.7x17.8mm', '62.70x17.80'],
+  '4.75-5.25': ['4.75~5.25'],
+  'ip65': ['ip65'],
+  '±1.2a': ['1.2a', '±1.2'],
+  'l1': ['l1'],
+  '32': ['32颗']
+};
+function qFillMatch(std, user) {
+  const a = qNormText(std), b = qNormText(user);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const alias = Q_ANSWER_ALIAS[a];
+  if (alias && alias.indexOf(b) >= 0) return true;
+  /* 数字近似：两边数字个数相同且逐个相对误差 ≤1% */
+  const na = a.match(/-?\d+(?:\.\d+)?/g), nb = b.match(/-?\d+(?:\.\d+)?/g);
+  if (na && nb && na.length === nb.length && na.length > 0) {
+    return na.every(function (x, i) {
+      const fx = parseFloat(x), fy = parseFloat(nb[i]);
+      if (fx === fy) return true;
+      const scale = Math.max(Math.abs(fx), Math.abs(fy));
+      return scale > 0 && Math.abs(fx - fy) <= scale * 0.01;
+    });
+  }
+  return false;
+}
+
+/* ---------- 从模型输出里抠出 JSON ---------- */
+function qParseAiJson(raw) {
+  let t = String(raw || '');
+  /* ★ 兜底：有些模型（如 MiniMax-M3）会先输出一段 <think>…</think> 思考过程，
+       JSON 在后面。M3.1-Flash 一般不输出，但统一剥一下更保险。 */
+  t = t.replace(/<think[\s\S]*?<\/think>/gi, '');
+  const i = t.indexOf('{'), j = t.lastIndexOf('}');
+  if (i < 0 || j <= i) return null;
+  try { return JSON.parse(t.slice(i, j + 1)); } catch (e) { return null; }
+}
+
+/* ---------- 简答题 AI 判分 ---------- */
+/* ★ 模型只回答「哪些得分点命中了」，**分数由程序按命中累加** ——
+   模型就算胡说，也最多错几个点，不会凭空给出 8 分。 */
+async function qAiGradeShort(env, q, userAnswer) {
+  const points = Array.isArray(q.points) ? q.points : [];
+  const max = Number(q.score || 3);
+  const answer = String(userAnswer || '').trim();
+  if (!points.length) {
+    return { score: 0, max: max, hits: [], confidence: 0, reason: '题目没有得分点', needManual: true };
+  }
+  if (!answer) {
+    return { score: 0, max: max, hits: [], confidence: 0, reason: '未作答', needManual: true };
+  }
+  const cfg = await qModelConfig(env);
+  if (!cfg.key) {
+    return { score: 0, max: max, hits: [], confidence: 0, reason: '服务端未配置模型密钥', needManual: true };
+  }
+  const pl = points.map(function (p, i) {
+    return '[' + i + '] ' + p.text + '（' + p.points + ' 分）';
+  }).join('\n');
+  const prompt = [
+    '你是培训考试判分助手。判断「考生答案」是否命中了每一个得分点。',
+    '',
+    '【题目】' + q.stem,
+    '',
+    '【参考答案】' + (q.reference || ''),
+    '',
+    '【得分点】',
+    pl,
+    '',
+    '【考生答案】' + answer,
+    '',
+    '只输出一个 JSON 对象，不要任何其它文字，也不要输出思考过程：',
+    '{"hits":[命中的得分点编号],"confidence":0到1之间的数,"reason":"一句话理由"}',
+    '',
+    '判定规则：',
+    '1. 只有当考生答案**实质性地表达**了该得分点的内容才算命中；只是出现了相近的词但意思相反，不算命中。',
+    '2. 没提到、答非所问、或与得分点无关的得分点，不命中。',
+    '3. 允许用不同措辞表达同一个意思。',
+    '4. confidence 是你对本次判断的把握程度（0 到 1）。'
+  ].join('\n');
+
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { ctrl.abort(); }, 25000);
+    const r = await fetch(cfg.base, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        stream: false
+      }),
+      signal: ctrl.signal
+    });
+    clearTimeout(timer);
+    if (!r.ok) {
+      return { score: 0, max: max, hits: [], confidence: 0,
+        reason: '模型返回 HTTP ' + r.status, needManual: true };
+    }
+    const j = await r.json();
+    const raw = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+    const out = qParseAiJson(raw);
+    if (!out || !Array.isArray(out.hits)) {
+      return { score: 0, max: max, hits: [], confidence: 0,
+        reason: '模型输出无法解析，需人工判分', needManual: true };
+    }
+    /* 只接受合法范围内的编号 */
+    const hits = [];
+    for (const h of out.hits) {
+      const i = parseInt(h, 10);
+      if (Number.isInteger(i) && i >= 0 && i < points.length && hits.indexOf(i) < 0) hits.push(i);
+    }
+    hits.sort(function (a, b) { return a - b; });
+    let score = 0;
+    for (const i of hits) score += Number(points[i].points || 0);
+    score = Math.max(0, Math.min(score, max));
+    let conf = parseFloat(out.confidence);
+    if (!Number.isFinite(conf)) conf = 0;
+    conf = Math.max(0, Math.min(1, conf));
+    /* 可信度低 → 标记出来让管理员重点看 */
+    const needManual = conf < 0.6 || (score === 0 && answer.length > 12);
+    return {
+      score: score, max: max, hits: hits, confidence: Math.round(conf * 100) / 100,
+      reason: String(out.reason || '').slice(0, 200),
+      needManual: needManual
+    };
+  } catch (e) {
+    const msg = (e && e.name === 'AbortError') ? '判分超时' : ('判分失败：' + ((e && e.message) || e));
+    return { score: 0, max: max, hits: [], confidence: 0, reason: msg, needManual: true };
+  }
+}
+
+/* 写一条通知。★ 通知写失败**绝不能影响主流程**（封禁/改角色照样要成功） */
+async function qNotify(env, name, type, title, body, link) {
+  if (!name) return;
+  try {
+    const key = qNotice(name);
+    const arr = (await env.KV.get(key, 'json')) || [];
+    arr.unshift({
+      id: token().slice(0, 16),
+      type: type || 'info',
+      title: title || '',
+      body: body || '',
+      link: link || '',
+      at: Date.now(),
+      read: false
+    });
+    await env.KV.put(key, JSON.stringify(arr.slice(0, 20)), { expirationTtl: NOTICE_TTL });
+  } catch (e) {
+    /* 通知写失败就忽略 */
+  }
+}
+
+/* ---------- 交卷 / 判分 / 复核 ---------- */
+async function qLoadQbank(env) {
+  const rec = await env.KV.get(Q_QBANK, 'json');
+  return (rec && rec.boards) ? rec : null;
+}
+function qFindBoard(qb, boardId) {
+  if (!qb) return null;
+  for (const b of qb.boards) if (b.id === boardId) return b;
+  return null;
+}
+function qFindQ(board, qid) {
+  if (!board) return null;
+  for (const q of (board.questions || [])) if (q.id === qid) return q;
+  return null;
+}
+
+/* POST /api/q/submit —— 交卷：程序判选择/填空，简答题留给 AI */
+async function handleQSubmit(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const boardId = String(b.board || '').trim();
+  const answers = (b.answers && typeof b.answers === 'object') ? b.answers : {};
+  const usedMs = Math.max(0, Number(b.usedMs) || 0);
+
+  const qb = await qLoadQbank(env);
+  if (!qb) return fail('题库尚未同步到服务器，请联系管理员', 503);
+  const board = qFindBoard(qb, boardId);
+  if (!board) return fail('没有这个板块', 404);
+
+  const auto = {};     /* 程序判的：选择题 / 填空题 */
+  const needGrade = []; /* 要 AI 判的：简答题 */
+  let autoScore = 0;
+  for (const q of (board.questions || [])) {
+    const raw = answers[q.id];
+    if (q.type === 'short') {
+      needGrade.push(q.id);
+      auto[q.id] = { score: 0, max: q.score || 3, kind: 'short', done: false };
+      continue;
+    }
+    if (q.type === 'fill') {
+      const blanks = q.blanks || [];
+      let sc = 0;
+      const detail = [];
+      for (let i = 0; i < blanks.length; i++) {
+        const user = raw && typeof raw === 'object' ? (raw['b' + (i + 1)] || '') : '';
+        const hit = qFillMatch(blanks[i].answer, user);
+        if (hit) sc += blanks[i].points;
+        detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(user || ''), hit: hit });
+      }
+      sc = Math.max(0, Math.min(sc, q.score || 2));
+      auto[q.id] = { score: sc, max: q.score || 2, kind: 'fill', done: true, blanks: detail };
+      autoScore += sc;
+      continue;
+    }
+    /* choice：答案是 0~3 的索引 */
+    let pick = -1;
+    if (typeof raw === 'number') pick = raw;
+    else if (typeof raw === 'string') {
+      const s = raw.trim().toUpperCase();
+      if (s >= 'A' && s <= 'D') pick = s.charCodeAt(0) - 65;
+      else if (/^[0-3]$/.test(s)) pick = parseInt(s, 10);
+    }
+    const ok = pick === q.answer;
+    const sc = ok ? (q.score || 1) : 0;
+    auto[q.id] = { score: sc, max: q.score || 1, kind: 'choice', done: true, pick: pick, right: ok };
+    autoScore += sc;
+  }
+
+  const subId = token().slice(0, 20);
+  const totalScore = (board.totalScore || (board.questions || []).reduce(function (a, q) { return a + (q.score || 0); }, 0));
+  const rec = {
+    id: subId, name: sess.name, board: boardId, boardName: board.name,
+    at: Date.now(), usedMs: usedMs, totalScore: totalScore,
+    answers: answers, auto: auto, ai: {},
+    status: needGrade.length ? 'grading' : 'pending_review',
+    finalScore: null, confidence: null
+  };
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+
+  if (!needGrade.length) {
+    /* 没有简答题 → 直接进入待复核 */
+    rec.status = 'pending_review';
+    rec.finalScore = autoScore;
+    rec.confidence = 100;
+    await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+    await qAfterGrading(env, rec, board);
+  }
+  return json({
+    ok: true, subId: subId, totalScore: totalScore, autoScore: autoScore,
+    needGrade: needGrade, status: rec.status
+  });
+}
+
+/* POST /api/q/grade-one —— 判一道简答题（前端并行调 N 次，每次请求都短） */
+async function handleQGradeOne(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const subId = String(b.subId || '').trim();
+  const qid = String(b.qid || '').trim();
+  const rec = await env.KV.get('q:sub:' + subId, 'json');
+  if (!rec) return fail('考试记录不存在', 404);
+  if (rec.name !== sess.name) return fail('只能判自己的卷', 403);
+
+  const qb = await qLoadQbank(env);
+  const board = qFindBoard(qb, rec.board);
+  const q = qFindQ(board, qid);
+  if (!q) return fail('题目不存在', 404);
+
+  const raw = rec.answers ? rec.answers[qid] : '';
+  const g = await qAiGradeShort(env, q, raw);
+  rec.ai = rec.ai || {};
+  rec.ai[qid] = g;
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  return json({ ok: true, qid: qid, result: g });
+}
+
+/* POST /api/q/finish —— 全部判完：汇总总分 + 可信度 + 发通知 */
+async function handleQFinish(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const subId = String(b.subId || '').trim();
+  const rec = await env.KV.get('q:sub:' + subId, 'json');
+  if (!rec) return fail('考试记录不存在', 404);
+  if (rec.name !== sess.name) return fail('只能提交自己的卷', 403);
+
+  const qb = await qLoadQbank(env);
+  const board = qFindBoard(qb, rec.board);
+
+  let score = 0, confSum = 0, confN = 0, shortCount = 0, shortMax = 0, pending = 0;
+  const perQ = {};
+  for (const q of ((board && board.questions) || [])) {
+    const a = rec.auto && rec.auto[q.id];
+    const g = rec.ai && rec.ai[q.id];
+    if (q.type === 'short') {
+      shortCount++; shortMax += (q.score || 3);
+      if (g) {
+        score += g.score; confSum += g.confidence; confN++;
+        perQ[q.id] = { score: g.score, max: g.max, ai: true };
+      } else {
+        pending++;
+        perQ[q.id] = { score: 0, max: q.score || 3, ai: true, pending: true };
+      }
+    } else if (a) {
+      score += a.score;
+    }
+  }
+  const confidence = confN ? Math.round((confSum / confN) * 100) : 100;
+  rec.status = pending ? 'grading' : 'pending_review';
+  rec.finalScore = score;
+  rec.confidence = confidence;
+  rec.perQ = perQ;
+  rec.shortCount = shortCount;
+  rec.shortMax = shortMax;
+  rec.pendingCount = pending;
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+
+  if (!pending) await qAfterGrading(env, rec, board);
+  return json({
+    ok: true, subId: subId, score: score, totalScore: rec.totalScore,
+    confidence: confidence, pending: pending, status: rec.status
+  });
+}
+
+/* 判分完成后：写进用户成绩记录 + 通知管理员 + 通知答题人 */
+async function qAfterGrading(env, rec, board) {
+  /* 写进用户自己的答题状态（这样「我的考试记录」里能看到） */
+  try {
+    const key = qState(rec.name);
+    const cur = (await env.KV.get(key, 'json')) || {};
+    const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
+    st.exams = Array.isArray(st.exams) ? st.exams : [];
+    st.exams.push({
+      at: rec.at, board: rec.board, boardName: rec.boardName,
+      score: rec.finalScore, total: rec.totalScore, usedMs: rec.usedMs,
+      subId: rec.id, pending: rec.status === 'pending_review'
+    });
+    if (st.exams.length > 100) st.exams = st.exams.slice(-100);
+    st.best = st.best || {};
+    const curBest = st.best[rec.board];
+    if (!curBest || rec.finalScore > curBest.score) {
+      st.best[rec.board] = { score: rec.finalScore, total: rec.totalScore, at: rec.at };
+    }
+    await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
+      { expirationTtl: 60 * 60 * 24 * 365 });
+  } catch (e) { /* 写成绩失败不影响主流程 */ }
+
+  /* 通知管理员/拥有者 */
+  const users = await env.KV.list({ prefix: 'q:user:' });
+  const admins = [];
+  for (const k of users.keys) {
+    const u = await env.KV.get(k.name, 'json');
+    if (u && u.enabled && (u.role === 'admin' || u.role === 'owner')) admins.push(u.name);
+  }
+  const low = rec.confidence != null && rec.confidence < 70;
+  for (const nm of admins) {
+    await qNotify(env, nm, low ? 'review_low' : 'review_new',
+      low ? '⚠ 有低可信度的判分待复核' : '有新的考试待复核',
+      rec.name + ' 刚提交了「' + rec.boardName + '」考试。AI 建议得分 ' + rec.finalScore
+      + ' / ' + rec.totalScore + '，整体可信度 ' + rec.confidence + '%。'
+      + (rec.shortCount ? rec.shortCount + ' 道简答题由 AI 判定，建议优先复核其中可信度偏低的几题。' : ''),
+      '#/admin');
+  }
+  /* 通知答题人 */
+  await qNotify(env, rec.name, 'grading_done', '等待管理员复核',
+    '「' + rec.boardName + '」考试已完成初步判分：AI 建议得分 ' + rec.finalScore
+    + ' / ' + rec.totalScore + '，整体可信度 ' + rec.confidence + '%。'
+    + '这只是初步结果，管理员会逐题复核，最终成绩以复核结果为准。',
+    '#/admin');
+}
+
+/* ---------- 复核相关 ---------- */
+async function handleQSubmissions(req, env, path, subId) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isQuizAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+
+  const list = await env.KV.list({ prefix: 'q:sub:' });
+  const rows = [];
+  for (const k of list.keys) {
+    const r = await env.KV.get(k.name, 'json');
+    if (!r) continue;
+    if (subId) {
+      if (r.id !== subId) continue;
+      const qb = await qLoadQbank(env);
+      const board = qFindBoard(qb, r.board);
+      const detail = {};
+      for (const q of ((board && board.questions) || [])) {
+        detail[q.id] = {
+          no: q.no, seq: (q.seq != null) ? q.seq : q.no,
+          type: q.type, stem: q.stem, score: q.score,
+          options: q.options || null, reference: q.reference || null,
+          points: q.points || null, blanks: q.blanks || null,
+          /* ★ answer：选择题的正确选项下标。漏了它管理员只能看到
+             「对/错」，看不到「正确答案是什么」，没法判断该不该改分。 */
+          answer: (typeof q.answer === 'number') ? q.answer : null,
+          explanation: q.explanation || '', source: q.source || '',
+          user: r.answers ? r.answers[q.id] : '',
+          auto: (r.auto && r.auto[q.id]) || null,
+          ai: (r.ai && r.ai[q.id]) || null
+        };
+      }
+      return json({ ok: true, sub: r, detail: detail });
+    }
+    rows.push({
+      id: r.id, name: r.name, board: r.board, boardName: r.boardName,
+      at: r.at, usedMs: r.usedMs, score: r.finalScore, total: r.totalScore,
+      confidence: r.confidence, status: r.status,
+      shortCount: r.shortCount || 0, shortMax: r.shortMax || 0
+    });
+  }
+  if (subId) return fail('考试记录不存在', 404);
+  rows.sort(function (a, b2) { return (b2.at || 0) - (a.at || 0); });
+  return json({ ok: true, rows: rows });
+}
+
+/* POST /api/q/submissions/:id/review —— 管理员逐题确认/改分后提交 */
+async function handleQReview(req, env, subId) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const admin = await isQuizAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const rec = await env.KV.get('q:sub:' + subId, 'json');
+  if (!rec) return fail('考试记录不存在', 404);
+
+  const perQ = (b.perQ && typeof b.perQ === 'object') ? b.perQ : {};
+  const qb = await qLoadQbank(env);
+  const board = qFindBoard(qb, rec.board);
+  const finalPer = {};
+  let score = 0;
+  for (const q of ((board && board.questions) || [])) {
+    const a = rec.auto && rec.auto[q.id];
+    const g = rec.ai && rec.ai[q.id];
+    let sc = null;
+    if (Object.prototype.hasOwnProperty.call(perQ, q.id)) {
+      const v = Number(perQ[q.id]);
+      if (Number.isFinite(v)) sc = Math.max(0, Math.min(v, q.score || 0));
+    }
+    if (sc == null) {
+      if (g) sc = g.score;
+      else if (a) sc = a.score;
+      else sc = 0;
+    }
+    finalPer[q.id] = { score: sc, max: q.score || 0 };
+    score += sc;
+  }
+  rec.perQ = finalPer;
+  rec.finalScore = score;
+  rec.status = 'reviewed';
+  rec.review = { by: admin.name, at: Date.now() };
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+
+  /* 同步更新用户成绩记录里的分数 */
+  try {
+    const key = qState(rec.name);
+    const cur = (await env.KV.get(key, 'json')) || {};
+    const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
+    if (Array.isArray(st.exams)) {
+      st.exams.forEach(function (e) {
+        if (e.subId === subId) { e.score = score; e.pending = false; e.reviewed = true; }
+      });
+    }
+    if (st.best && st.best[rec.board]) {
+      const curBest = st.best[rec.board];
+      if (score > curBest.score) st.best[rec.board] = { score: score, total: rec.totalScore, at: rec.at };
+    }
+    await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
+      { expirationTtl: 60 * 60 * 24 * 365 });
+  } catch (e) { /* 忽略 */ }
+
+  await qNotify(env, rec.name, 'review_done', '考试评价已完成',
+    admin.name + ' 已完成你的「' + rec.boardName + '」考试评价，最终得分 ' + score + ' / '
+    + rec.totalScore + '（' + (rec.totalScore ? Math.round(score * 100 / rec.totalScore) : 0)
+    + '%）。复核明细可以在「我的考试记录」里逐题查看。', '#/admin');
+  return json({ ok: true, finalScore: score, totalScore: rec.totalScore });
+}
+
+/* ---------- 我的考试记录（普通用户看自己的） ---------- */
+async function handleQMySubs(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+  const list = await env.KV.list({ prefix: 'q:sub:' });
+  const rows = [];
+  for (const k of list.keys) {
+    const r = await env.KV.get(k.name, 'json');
+    if (!r || r.name !== sess.name) continue;
+    rows.push({
+      id: r.id, board: r.board, boardName: r.boardName, at: r.at, usedMs: r.usedMs,
+      score: r.finalScore, total: r.totalScore, confidence: r.confidence,
+      status: r.status, shortCount: r.shortCount || 0, shortMax: r.shortMax || 0
+    });
+  }
+  rows.sort(function (a, b2) { return (b2.at || 0) - (a.at || 0); });
+  return json({ ok: true, rows: rows });
+}
+
+/* GET /api/q/my/subs/:id —— 用户查**自己**那次的逐题明细
+   ★ 只给他自己的答案 + AI 判定 + 最终得分，**不下发标准答案/得分点**：
+     否则用户做完就能翻出答案背下一次考试，题库就废了。 */
+async function handleQMySubDetail(req, env, subId) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+  const rec = await env.KV.get('q:sub:' + subId, 'json');
+  if (!rec) return fail('考试记录不存在', 404);
+  if (rec.name !== sess.name) return fail('只能查看自己的考试记录', 403);
+
+  const qb = await qLoadQbank(env);
+  const board = qFindBoard(qb, rec.board);
+  const detail = {};
+  for (const q of ((board && board.questions) || [])) {
+    const a = (rec.auto && rec.auto[q.id]) || null;
+    const g = (rec.ai && rec.ai[q.id]) || null;
+    const fin = (rec.perQ && rec.perQ[q.id]) ? rec.perQ[q.id] : null;
+    const item = {
+      no: q.no, seq: (q.seq != null) ? q.seq : q.no,
+      type: q.type, stem: q.stem, score: q.score,
+      user: rec.answers ? rec.answers[q.id] : '',
+      final: fin ? fin.score : null,
+      max: q.score || 0,
+      options: q.options || null,
+      answer: (typeof q.answer === 'number') ? q.answer : null,
+      reference: q.reference || null,
+      points: q.points || null,
+      explanation: q.explanation || ''
+    };
+    if (q.type === 'choice' && a) {
+      item.pick = (typeof a.pick === 'number' && a.pick >= 0) ? a.pick : null;
+      item.right = !!a.right;
+    }
+    if (q.type === 'fill' && a && Array.isArray(a.blanks)) {
+      item.blanks = a.blanks.map(function (b) {
+        return { id: b.id, user: b.user, answer: b.answer, hit: !!b.hit };
+      });
+    }
+    if (q.type === 'short' && g) {
+      item.ai = { score: g.score, max: g.max, hits: g.hits || [],
+        confidence: g.confidence, reason: g.reason, needManual: !!g.needManual };
+      /* 得分点的文字也要打码 —— 只给编号，文字是答案的一部分 */
+      item.hitCount = (g.hits || []).length;
+      item.pointCount = Array.isArray(q.points) ? q.points.length : 0;
+    }
+    detail[q.id] = item;
+  }
+  return json({
+    ok: true,
+    sub: {
+      id: rec.id, board: rec.board, boardName: rec.boardName, at: rec.at,
+      usedMs: rec.usedMs, score: rec.finalScore, total: rec.totalScore,
+      confidence: rec.confidence, status: rec.status,
+      shortCount: rec.shortCount || 0, shortMax: rec.shortMax || 0
+    },
+    detail: detail
+  });
+}
+
+/* POST /api/q/admin/qbank —— 把题库同步进服务器（owner 才能写）
+   POST /api/q/admin/aicfg —— 写 AI 配置（key/base/model），owner 才能写 */
+async function handleQAdminConfig(req, env, what) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const owner = await isQuizOwner(req, env);
+  if (!owner) return fail('只有拥有者可以执行', 403);
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
+
+  if (what === 'qbank') {
+    if (!b || !Array.isArray(b.boards)) return fail('缺少 boards');
+    const rec = { version: String(b.version || ''), boards: b.boards, at: Date.now() };
+    await env.KV.put(Q_QBANK, JSON.stringify(rec));
+    const n = b.boards.reduce(function (a, x) { return a + ((x.questions || []).length); }, 0);
+    return json({ ok: true, boards: b.boards.length, questions: n });
+  }
+  /* aicfg：
+     ★ key 留空 = **保持原密钥不变**（原来留空等于清空，一不小心就把判分通道弄挂了）。
+       要清除必须显式传 clearKey:true。 */
+  let prev = null;
+  try { prev = await env.KV.get(Q_AICFG, 'json'); } catch (e) { prev = null; }
+  prev = prev || {};
+  let key = prev.key || '';
+  if (b.clearKey === true) key = '';
+  else if (typeof b.key === 'string' && b.key.trim()) key = b.key.trim();
+  const rec = {
+    key: key,
+    base: typeof b.base === 'string' && b.base ? b.base.trim() : (prev.base || 'https://api.minimaxi.com/v1/chat/completions'),
+    model: typeof b.model === 'string' && b.model ? b.model.trim() : (prev.model || 'MiniMax-M3.1-Flash')
+  };
+  await env.KV.put(Q_AICFG, JSON.stringify(rec));
+  return json({ ok: true, base: rec.base, model: rec.model, hasKey: !!rec.key });
+}
+
+/* 站内通知接口：GET 读我的 / POST 标记已读 */
+async function handleQNotices(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+
+  const key = qNotice(sess.name);
+  const arr = (await env.KV.get(key, 'json')) || [];
+
+  if (req.method === 'POST') {
+    let b = {};
+    try { b = await qReadBody(req); } catch (e) { b = {}; }
+    const ids = Array.isArray(b.ids) ? b.ids.map(x => String(x)) : null;
+    for (const n of arr) {
+      if (!n.read && (!ids || ids.indexOf(String(n.id)) >= 0)) n.read = true;
+    }
+    await env.KV.put(key, JSON.stringify(arr), { expirationTtl: NOTICE_TTL });
+    return json({ ok: true, unread: 0 });
+  }
+
+  const unread = arr.filter(n => !n.read).length;
+  return json({ ok: true, notices: arr.slice(0, 20), unread: unread });
 }
 
 async function qPurgeSessions(env, name) {
@@ -1033,7 +1705,14 @@ function sanitizeQuizState(st) {
         score: Math.max(0, Number(e.score) || 0), total: Math.max(0, Number(e.total) || 0),
         usedMs: Math.max(0, Number(e.usedMs) || 0),
         wrongIds: Array.isArray(e.wrongIds) ? e.wrongIds.slice(0, 500).map(x => str(x, 64)) : [],
-        wrongPicks: wp
+        wrongPicks: wp,
+        /* ★ subId / pending / reviewed **必须保留**：
+           handleQReview 靠 subId 找到「哪一条考试记录」并改分，
+           洗掉之后管理员复核改分永远不生效（复核页改了分，成绩也不变）。
+           老记录没有 subId 就是空串，不影响。 */
+        subId: str(e.subId, 64),
+        pending: !!e.pending,
+        reviewed: !!e.reviewed
       });
     }
   }
@@ -1078,6 +1757,32 @@ async function handleQQuizState(req, env) {
     if (typeof st === 'string') { try { st = JSON.parse(st); } catch (e) { st = null; } }
     if (!st || typeof st !== 'object') return fail('缺少 state');
     const clean = sanitizeQuizState(st);
+    /* ★ 考试记录是**服务端权威**，不能被前端整份覆盖。
+       前端 persist() 推上来的是本地 state（本地没有服务端那条新记录），
+       直接 put 的话会把刚写入的考试记录连同 subId/pending 一起抹掉，
+       表现为「交卷后成绩条没了 / 复核完分数又跳回去」。
+       合并规则：服务端的排前面（分数已定稿），客户端独有的追加在后面，
+       按 subId 去重；老记录（没有 subId）按「时间|板块|分数」去重。 */
+    try {
+      const prev = await env.KV.get(key, 'json');
+      const pst = (prev && prev.state) ? prev.state : null;
+      if (pst && Array.isArray(pst.exams) && pst.exams.length) {
+        const seen = {};
+        const merged = [];
+        const push = function (e) {
+          if (!e || typeof e !== 'object') return;
+          const k = e.subId
+            ? 's:' + String(e.subId)
+            : 'c:' + (Number(e.at) || 0) + '|' + String(e.board || '') + '|' + (Number(e.score) || 0) + '|' + (Number(e.total) || 0);
+          if (seen[k]) return;
+          seen[k] = 1;
+          merged.push(e);
+        };
+        for (const e of pst.exams) push(e);
+        for (const e of (clean.exams || [])) push(e);
+        clean.exams = merged.slice(-MAX_QUIZ_EXAMS);
+      }
+    } catch (e) { /* 读不到就按前端的状态写 */ }
     await env.KV.put(key, JSON.stringify({ state: clean, name: s.name, at: Date.now() }));
     return json({ ok: true, saved: true });
   }
@@ -1215,6 +1920,8 @@ async function handleQAdminUsers(req, env, path) {
       return fail('拥有者不能停用', 403);
     }
     let revoke = false;
+    const oldRole = u.role;
+    const oldEnabled = u.enabled !== false;
     if (typeof b.enabled === 'boolean') u.enabled = b.enabled;
     if (b.role) {
       /* ★ 角色变更**只有拥有者**能做（2026-11-23）。
@@ -1232,6 +1939,26 @@ async function handleQAdminUsers(req, env, path) {
       u.pwd = hash; u.salt = salt;
       u.pwdAt = Date.now();
       revoke = true;
+    }
+    /* ★ 给当事人发站内通知（文案见 站内通知文案（2026-11-23）.md） */
+    if (u.role !== oldRole) {
+      await qNotify(env, u.name, u.role === 'admin' ? 'role_admin' : 'role_user',
+        u.role === 'admin' ? '你已被设为管理员' : '管理员身份已取消',
+        u.role === 'admin'
+          ? admin.name + ' 已将你设为答题库管理员，现在你可以查看全员答题数据、导出报表、管理账号。你原有的学习记录不受影响。'
+          : admin.name + ' 已取消你的管理员身份。你原有的学习记录、错题本和考试成绩都不受影响，仍然可以正常答题。',
+        '#/admin');
+    }
+    if (u.enabled === false && oldEnabled) {
+      await qNotify(env, u.name, 'banned', '账号已被停用',
+        admin.name + ' 已停用你的账号，暂时无法登录。如有疑问请联系管理员。', '');
+    } else if (u.enabled !== false && !oldEnabled) {
+      await qNotify(env, u.name, 'unbanned', '账号已恢复',
+        admin.name + ' 已恢复你的账号，可以正常登录了。', '');
+    }
+    if (b.pwd) {
+      await qNotify(env, u.name, 'pwd_reset', '密码已被重置',
+        admin.name + ' 已重置你的密码，请用新密码登录。', '#/login');
     }
     u.updAt = Date.now();
     await env.KV.put(qUser(id), JSON.stringify(u));
@@ -2206,6 +2933,25 @@ async function route(req, env) {
     if (p === '/api/q/login')    return withJson(await handleQLogin(req, env), req, env);
     if (p === '/api/q/session')  return withJson(await handleQSession(req, env), req, env);
     if (p === '/api/q/whereami') return withJson(await handleQWhereami(req, env), req, env);
+    if (p === '/api/q/notices')  return withJson(await handleQNotices(req, env), req, env);
+    if (p === '/api/q/submit')   return withJson(await handleQSubmit(req, env), req, env);
+    if (p === '/api/q/grade-one') return withJson(await handleQGradeOne(req, env), req, env);
+    if (p === '/api/q/finish')  return withJson(await handleQFinish(req, env), req, env);
+    if (p === '/api/q/my/subs') return withJson(await handleQMySubs(req, env), req, env);
+    if (p.startsWith('/api/q/my/subs/')) {
+      const mid = decodeURIComponent(p.replace('/api/q/my/subs/', ''));
+      return withJson(await handleQMySubDetail(req, env, mid), req, env);
+    }
+    if (p === '/api/q/submissions') return withJson(await handleQSubmissions(req, env, p, ''), req, env);
+    if (p.startsWith('/api/q/submissions/')) {
+      const sid = decodeURIComponent(p.replace('/api/q/submissions/', ''));
+      if (req.method === 'POST' && sid.endsWith('/review')) {
+        return withJson(await handleQReview(req, env, sid.replace(/\/review$/, '')), req, env);
+      }
+      return withJson(await handleQSubmissions(req, env, p, sid), req, env);
+    }
+    if (p === '/api/q/admin/qbank') return withJson(await handleQAdminConfig(req, env, 'qbank'), req, env);
+    if (p === '/api/q/admin/aicfg') return withJson(await handleQAdminConfig(req, env, 'aicfg'), req, env);
     if (p === '/api/q/ping')     return withJson(await handleQPing(req, env), req, env);
     if (p === '/api/q/logout')   return withJson(await handleQLogout(req, env), req, env);
     if (p === '/api/q/quiz/state') return withJson(await handleQQuizState(req, env), req, env);
