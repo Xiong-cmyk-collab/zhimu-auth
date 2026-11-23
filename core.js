@@ -1209,6 +1209,11 @@ async function handleQAdminUsers(req, env, path) {
     const u = await env.KV.get(qUser(id), 'json');
     if (!u) return fail('账号不存在', 404);
     if (u.name === admin.name && b.enabled === false) return fail('不能停用自己这个管理员', 403);
+    /* ★ 拥有者不能被停用 —— 否则「拥有者有且只有这 2 个」就不成立了。
+       （降级 owner 也在下面那条 role 分支里挡住了） */
+    if (b.enabled === false && (u.role === 'owner' || QUIZ_OWNERS.indexOf(u.name) >= 0)) {
+      return fail('拥有者不能停用', 403);
+    }
     let revoke = false;
     if (typeof b.enabled === 'boolean') u.enabled = b.enabled;
     if (b.role) {
@@ -1247,6 +1252,10 @@ async function handleQAdminUsers(req, env, path) {
     const u = await env.KV.get(qUser(id), 'json');
     if (!u) return fail('账号不存在', 404);
     if (u.name === admin.name) return fail('不能删掉自己这个管理员', 403);
+    /* ★ 拥有者不能被删除（用户要求：拥有者有且只有 ZM1、ZM2 两个） */
+    if (u.role === 'owner' || QUIZ_OWNERS.indexOf(u.name) >= 0) {
+      return fail('拥有者不能删除', 403);
+    }
     const prev = await env.KV.get(qUid(u.name), 'json');
     await env.KV.delete(qUser(id));
     await env.KV.delete(qName(u.name));
