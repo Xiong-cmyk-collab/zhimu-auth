@@ -1469,6 +1469,20 @@ function qCleanOrphanBest(st) {
   }
 }
 
+/* 现存的考试明细 id 集合（q:sub:<id>）。
+   ★ 考试记录**以明细为准**：明细没了 = 这条记录已经被删掉了。
+   一次最多列 1000 条；正好满 1000 就返回 null（读不全就别过滤，
+   宁可多显示一条，也不要把真人记录误删）。 */
+async function qLiveSubIds(env) {
+  try {
+    const list = await env.KV.list({ prefix: 'q:sub:', limit: 1000 });
+    if (list.keys.length >= 1000) return null;
+    const live = {};
+    for (const k of list.keys) live[k.name.slice('q:sub:'.length)] = 1;
+    return live;
+  } catch (e) { return null; }
+}
+
 /* 判分完成后：写进用户成绩记录 + 通知管理员 + 通知答题人 */
 async function qAfterGrading(env, rec, board) {
   /* 写进用户自己的答题状态（这样「我的考试记录」里能看到） */
@@ -2410,14 +2424,26 @@ async function handleQQuizState(req, env) {
   const key = qState(s.name);
   if (req.method === 'GET') {
     const rec = await env.KV.get(key, 'json');
-    return json({ ok: true, state: (rec && rec.state) ? rec.state : null });
+    const st = (rec && rec.state) ? rec.state : null;
+    /* ★ 下发之前先滤掉「明细已不在」的记录 ——
+       不然客户端会把这些幽灵缓存推回来，用户明明删了它又冒出来。 */
+    if (st && Array.isArray(st.exams)) {
+      const live = await qLiveSubIds(env);
+      if (live) st.exams = st.exams.filter(function (e) { return !e || !e.subId || live[e.subId]; });
+    }
+    return json({ ok: true, state: st });
   }
   if (req.method === 'POST') {
     if (!b) return fail('请求体不是合法 JSON');
     /* op=load：只读（前端用 POST + form 传令牌，免 CORS 预检） */
     if (b.op === 'load') {
       const rec = await env.KV.get(key, 'json');
-      return json({ ok: true, state: (rec && rec.state) ? rec.state : null });
+      const st = (rec && rec.state) ? rec.state : null;
+      if (st && Array.isArray(st.exams)) {
+        const live = await qLiveSubIds(env);
+        if (live) st.exams = st.exams.filter(function (e) { return !e || !e.subId || live[e.subId]; });
+      }
+      return json({ ok: true, state: st });
     }
     /* form 传过来的 state 是 JSON 字符串，要解一次 */
     let st = b.state;
@@ -2441,9 +2467,29 @@ async function handleQQuizState(req, env) {
        表现为「交卷后成绩条没了 / 复核完分数又跳回去」。
        合并规则：服务端的排前面（分数已定稿），客户端独有的追加在后面，
        按 subId 去重；老记录（没有 subId）按「时间|板块|分数」去重。 */
+    /* ★★ 服务端是考试记录的**权威**：只有明细（q:sub:<id>）还在的记录才算数。
+       不这么做的后果：本机 localStorage 里缓存过的**已删除记录**，
+       每次 persist 都被推回服务端 → 用户明明删了，它又冒出来
+       （用户反馈「我已经删掉了，为什么这个还一直存在」）。
+       被丢掉的 id 会回报给客户端，让它把本机缓存也一并摘掉。 */
+    const dropped = [];
+    let live = await qLiveSubIds(env);
+    let prev = null;
+    try { prev = await env.KV.get(key, 'json'); } catch (e) { prev = null; }
+    const pst = (prev && prev.state) ? prev.state : null;
+    const keepOnlyLive = function (arr) {
+      return (arr || []).filter(function (e) {
+        if (!e || !e.subId) return true;      /* 没有 subId 的（离线卷/老记录）留��� */
+        if (live[String(e.subId)]) return true;
+        dropped.push(String(e.subId));
+        return false;
+      });
+    };
+    if (live) {
+      clean.exams = keepOnlyLive(clean.exams);
+      if (pst && Array.isArray(pst.exams)) pst.exams = keepOnlyLive(pst.exams);
+    }
     try {
-      const prev = await env.KV.get(key, 'json');
-      const pst = (prev && prev.state) ? prev.state : null;
       if (pst && Array.isArray(pst.exams) && pst.exams.length) {
         const seen = {};
         const merged = [];
@@ -2481,7 +2527,7 @@ async function handleQQuizState(req, env) {
        同步进来时顺手把它清掉，首页卡片才不会继续显示。 */
     qCleanOrphanBest(clean);
     await env.KV.put(key, JSON.stringify({ state: clean, name: s.name, at: Date.now() }));
-    return json({ ok: true, saved: true });
+    return json({ ok: true, saved: true, dropped: dropped });
   }
   return json({ ok: false, error: 'method_not_allowed' }, 405);
 }
