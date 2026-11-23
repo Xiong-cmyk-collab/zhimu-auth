@@ -1661,67 +1661,7 @@ async function qRetryAllDue(env, onlyName) {
   return { ok: true, scanned: scanned, due: due, skipped: skipped, redone: redone, remain: remain, touched: touched.length };
 }
 
-/* POST /api/q/admin/clear-stale-wrong —— 一键清掉全站「孤儿错题」
-   （题库换版后老题号留下的错题，点进错题本其实是空的） */
-async function handleQClearStaleWrong(req, env) {
-  const bad = assertSameOrigin(req, env);
-  if (bad) return bad;
-  const admin = await isQuizAdmin(req, env);
-  if (!admin) return fail('需要管理员权限', 403);
-  const valid = await qValidIds(env);
-  const ul = await env.KV.list({ prefix: 'q:user:' });
-  let removed = 0, users = 0;
-  for (const k of ul.keys) {
-    const u = await env.KV.get(k.name, 'json');
-    if (!u) continue;
-    const sk = qState(u.name);
-    const cur = await env.KV.get(sk, 'json');
-    if (!cur || !cur.state || !cur.state.wrong) continue;
-    const wrong = cur.state.wrong;
-    let n = 0;
-    for (const qid of Object.keys(wrong)) {
-      if (!valid[qid]) { delete wrong[qid]; n++; }
-    }
-    if (n) {
-      removed += n; users++;
-      await env.KV.put(sk, JSON.stringify({ state: cur.state, name: u.name, at: Date.now() }),
-        { expirationTtl: 60 * 60 * 24 * 365 });
-    }
-  }
-  return json({ ok: true, removed: removed, users: users });
-}
 
-/* POST /api/q/admin/clear-exams —— 清空全部考试记录（管理员）
-   ★ 题库换版后清掉上一版的成绩记录（老 30 分制 vs 新 150 分制混在一起没法看）。
-   · 删掉所有 q:sub:* 记录（每道题的 AI 判定独立 key 前缀一样，一起删）
-   · 清空所有账号的 state.exams 与 state.best */
-async function handleQClearExams(req, env) {
-  const bad = assertSameOrigin(req, env);
-  if (bad) return bad;
-  const admin = await isQuizAdmin(req, env);
-  if (!admin) return fail('需要管理员权限', 403);
-
-  let subs = 0;
-  const list = await env.KV.list({ prefix: 'q:sub:' });
-  for (const k of list.keys) {
-    try { await env.KV.delete(k.name); subs++; } catch (e) { /* 忽略单个失败 */ }
-  }
-  let users = 0;
-  const ul = await env.KV.list({ prefix: 'q:user:' });
-  for (const k of ul.keys) {
-    const u = await env.KV.get(k.name, 'json');
-    if (!u) continue;
-    const sk = qState(u.name);
-    const cur = await env.KV.get(sk, 'json');
-    if (!cur || !cur.state) continue;
-    cur.state.exams = [];
-    cur.state.best = {};
-    await env.KV.put(sk, JSON.stringify({ state: cur.state, name: u.name, at: Date.now() }),
-      { expirationTtl: 60 * 60 * 24 * 365 });
-    users++;
-  }
-  return json({ ok: true, subs: subs, users: users });
-}
 
 /* POST /api/q/admin/retry-grading —— 管理员手动触发重判
    POST /api/q/retry-mine        —— 答题人触发重判自己的 */
@@ -3498,8 +3438,6 @@ async function route(req, env) {
     if (p === '/api/q/notices')  return withJson(await handleQNotices(req, env), req, env);
     if (p === '/api/q/retry-mine') return withJson(await handleQRetryGrading(req, env, true), req, env);
     if (p === '/api/q/admin/retry-grading') return withJson(await handleQRetryGrading(req, env, false), req, env);
-    if (p === '/api/q/admin/clear-exams') return withJson(await handleQClearExams(req, env), req, env);
-    if (p === '/api/q/admin/clear-stale-wrong') return withJson(await handleQClearStaleWrong(req, env), req, env);
     if (p === '/api/q/submit')   return withJson(await handleQSubmit(req, env), req, env);
     if (p === '/api/q/grade-one') return withJson(await handleQGradeOne(req, env), req, env);
     if (p === '/api/q/finish')  return withJson(await handleQFinish(req, env), req, env);
