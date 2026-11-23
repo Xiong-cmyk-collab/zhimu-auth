@@ -1371,6 +1371,19 @@ async function handleQFinish(req, env) {
   });
 }
 
+/* 列出全部答题账号名（删记录时要把所有账号的汇总都扫一遍） */
+async function qUserNames(env) {
+  const out = [];
+  try {
+    const list = await env.KV.list({ prefix: 'q:user:' });
+    for (const k of list.keys) {
+      const u = await env.KV.get(k.name, 'json');
+      if (u && u.name) out.push(u.name);
+    }
+  } catch (e) { /* 读不到就按空的处理 */ }
+  return out;
+}
+
 /* 判分完成后：写进用户成绩记录 + 通知管理员 + 通知答题人 */
 async function qAfterGrading(env, rec, board) {
   /* 写进用户自己的答题状态（这样「我的考试记录」里能看到） */
@@ -1379,11 +1392,42 @@ async function qAfterGrading(env, rec, board) {
     const cur = (await env.KV.get(key, 'json')) || {};
     const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
     st.exams = Array.isArray(st.exams) ? st.exams : [];
-    st.exams.push({
+    /* ★ 后端**自己算错题**（以前只写分数、不写错题）。
+       少了 wrongIds，后台历史抽屉就显示「全对」、点开什么都没有 ——
+       用户反馈「我点了它，没有反应」。 */
+    const wrongIds = [], wrongPicks = {};
+    for (const q of ((board && board.questions) || [])) {
+      const a = (rec.auto && rec.auto[q.id]) || null;
+      const pq = (rec.perQ && rec.perQ[q.id]) || null;
+      let got = 0, max = 0;
+      if (q.type === 'short') {
+        /* 简答题的得分在 perQ 里（auto 里的 short 永远是 0 分） */
+        got = pq ? (Number(pq.score) || 0) : 0;
+        max = pq ? (Number(pq.max) || 0) : (q.score || 3);
+      } else {
+        got = a ? (Number(a.score) || 0) : 0;
+        max = a ? (Number(a.max) || 0) : (q.score || 0);
+      }
+      if (max > 0 && got < max) {
+        wrongIds.push(q.id);
+        /* 只有选择题有「他选了第几项」；填空/简答是文本，记不了 */
+        if (a && a.kind === 'choice' && typeof a.pick === 'number' && a.pick >= 0) wrongPicks[q.id] = a.pick;
+      }
+    }
+    const entry = {
       at: rec.at, board: rec.board, boardName: rec.boardName,
       score: rec.finalScore, total: rec.totalScore, usedMs: rec.usedMs,
-      subId: rec.id, pending: rec.status === 'pending_review'
-    });
+      subId: rec.id, pending: rec.status === 'pending_review',
+      wrongIds: wrongIds, wrongPicks: wrongPicks
+    };
+    /* ★ 幂等：同一个 subId **就地更新**，不重复 push。
+       原来是无脑 push → 同一次考试（提交时写一次、finish 时又写一次）
+       会出现两条一模一样的记录。 */
+    let hit = -1;
+    for (let i = 0; i < st.exams.length; i++) {
+      if (st.exams[i] && st.exams[i].subId === rec.id) { hit = i; break; }
+    }
+    if (hit >= 0) st.exams[hit] = entry; else st.exams.push(entry);
     if (st.exams.length > 100) st.exams = st.exams.slice(-100);
     st.best = st.best || {};
     const curBest = st.best[rec.board];
@@ -1486,32 +1530,46 @@ async function handleQSubDelete(req, env, subId) {
 
   const key = 'q:sub:' + subId;
   const rec = await env.KV.get(key, 'json');
-  if (!rec) return fail('考试记录不存在', 404);
 
-  /* 每道题的 AI 判定是独立 key，要一并删掉。
-     ★ 必须**并行**删：100 道题串行 delete 实测要 6 秒多，
-       前端等得以为没删掉（列表不刷新）。 */
-  const qb = await qLoadQbank(env);
-  const board = qFindBoard(qb, rec.board);
-  const dels = ((board && board.questions) || []).map(function (q) {
-    return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
-  });
-  await Promise.all(dels);
-  await env.KV.delete(key);
+  /* ★ 明细可能**已经没了**（删过一次 / 180 天过期），但成绩汇总里还留着这一条。
+     原来这里直接 404 → 汇总永远摘不掉 → 后台「考试=1」删了还在，
+     用户再点就是「读取失败」。现在：**明细没了也照样把汇总摘干净**。 */
+  if (rec) {
+    /* 每道题的 AI 判定是独立 key，要一并删掉。
+       ★ 必须**并行**删：100 道题串行 delete 实测要 6 秒多，
+         前端等得以为没删掉（列表不刷新）。 */
+    const qb = await qLoadQbank(env);
+    const board = qFindBoard(qb, rec.board);
+    const dels = ((board && board.questions) || []).map(function (q) {
+      return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
+    });
+    await Promise.all(dels);
+    await env.KV.delete(key);
+  }
 
-  /* 答题人自己的成绩记录里也摘掉这一条 */
-  try {
-    const sk = qState(rec.name);
-    const cur = (await env.KV.get(sk, 'json')) || {};
-    const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
-    if (Array.isArray(st.exams)) {
-      st.exams = st.exams.filter(function (e) { return e.subId !== subId; });
-      await env.KV.put(sk, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
-        { expirationTtl: 60 * 60 * 24 * 365 });
-    }
-  } catch (e) { /* 忽略 */ }
+  /* 答题人自己的成绩记录里也摘掉这一条。
+     ★ 扫**所有**账号：明细没了的时候不知道这条属于谁，只能全扫。 */
+  const names = await qUserNames(env);
+  if (rec && names.indexOf(rec.name) < 0) names.push(rec.name);
+  const cleaned = [];
+  for (const nm of names) {
+    try {
+      const sk = qState(nm);
+      const cur = (await env.KV.get(sk, 'json')) || {};
+      const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
+      if (Array.isArray(st.exams)) {
+        const before = st.exams.length;
+        st.exams = st.exams.filter(function (e) { return e.subId !== subId; });
+        if (st.exams.length !== before) {
+          cleaned.push(nm);
+          await env.KV.put(sk, JSON.stringify({ state: st, name: nm, at: Date.now() }),
+            { expirationTtl: 60 * 60 * 24 * 365 });
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+  }
 
-  return json({ ok: true, id: subId, name: rec.name });
+  return json({ ok: true, id: subId, name: rec ? rec.name : (cleaned[0] || ''), cleaned: cleaned });
 }
 
 /* POST /api/q/submissions/:id/review —— 管理员逐题确认/改分后提交 */
@@ -2319,8 +2377,22 @@ async function handleQQuizState(req, env) {
           const k = e.subId
             ? 's:' + String(e.subId)
             : 'c:' + (Number(e.at) || 0) + '|' + String(e.board || '') + '|' + (Number(e.score) || 0) + '|' + (Number(e.total) || 0);
-          if (seen[k]) return;
-          seen[k] = 1;
+          if (seen[k]) {
+            /* ★ 同一个 subId 已经有了一份 → **合并**，别整份丢掉。
+               后端写的那份以前不带 wrongIds（后端不算错题），
+               前端写的那份带 —— 丢了就等于「后台说全对、点开没东西」。 */
+            const old = merged[seen[k] - 1];
+            const ow = (old.wrongIds && old.wrongIds.length) ? old.wrongIds : (e.wrongIds || []);
+            if (ow && ow.length) old.wrongIds = ow;
+            if (!old.wrongPicks || !Object.keys(old.wrongPicks).length) old.wrongPicks = e.wrongPicks || {};
+            if ((Number(e.score) || 0) > (Number(old.score) || 0)) {
+              old.score = e.score; old.total = e.total;
+            }
+            if (old.pending == null && e.pending != null) old.pending = e.pending;
+            if (old.reviewed == null && e.reviewed != null) old.reviewed = e.reviewed;
+            return;
+          }
+          seen[k] = merged.length + 1;
           merged.push(e);
         };
         for (const e of pst.exams) push(e);
@@ -2355,12 +2427,29 @@ async function collectQuizRows(env) {
   const list = await env.KV.list({ prefix: 'q:user:' });
   const rows = [];
   const valid = await qValidIds(env);
+  /* ★ 先把**现存的考试明细**列出来：汇总里那些明细已经没了的
+     （删过一次 / 180 天过期）不该再计入「考试次数」——
+     否则后台永远显示「考试=1」，用户点删除也说删不掉。 */
+  let live = null;
+  try {
+    const subs = await env.KV.list({ prefix: 'q:sub:', limit: 1000 });
+    /* 一次最多列 1000 条；正好满 1000 说明可能还有更多，
+       这次就不过滤（宁可多显示一条，也不要误显示） */
+    if (subs.keys.length < 1000) {
+      live = {};
+      for (const k of subs.keys) live[k.name.slice('q:sub:'.length)] = 1;
+    }
+  } catch (e) { live = null; }
   for (const k of list.keys) {
     const u = await env.KV.get(k.name, 'json');
     if (!u) continue;
     const rec = await env.KV.get(qState(u.name), 'json');
     const st = (rec && rec.state) ? rec.state : null;
-    const exams = (st && Array.isArray(st.exams)) ? st.exams : [];
+    const examsRaw = (st && Array.isArray(st.exams)) ? st.exams : [];
+    /* 明细已不存在的（孤儿汇总）不算数 */
+    const exams = live ? examsRaw.filter(function (e) {
+      return !e || !e.subId || live[e.subId];
+    }) : examsRaw;
     const last = exams.length ? exams[exams.length - 1] : null;
     const best = (st && st.best && last) ? (st.best[last.board] || null) : null;
     rows.push({
