@@ -13,7 +13,7 @@
  * core.js 里那条「iat 比令牌新才作废」的规则保留着当双保险。
  * ===================================================================== */
 
-import { route as coreFetch } from '../core.js';
+import { route as coreFetch, qRetryAllDue } from '../core.js';
 import { toKey, toStr, toPrefix } from './kv-keys.js';
 
 /* 键名转换规则见同目录 kv-keys.js（抽成独立模块是为了能直接跑单测）：
@@ -194,6 +194,27 @@ async function ensureConfig() {
   env.MODEL_NAME = env.MODEL_NAME || c.modelName || 'MiniMax-M3.1-Flash';
   env.CONFIG_SOURCE = 'kv';
   console.log('✅ 已从 KV 补齐配置');
+}
+
+/* =====================================================================
+ * Deno Deploy cron 任务：每 5 分钟跑一次
+ * ---------------------------------------------------------------------
+ * 把「AI 没判出分」的简答题重新交给模型判一遍。
+ * ★ 人工已经复核过的（status='reviewed'）一律跳过 —— 管理员都定稿了，
+ *   AI 再判一遍把分数改回去才是添乱。
+ * deno.json 里的配置：tasks.cron.retrygrading = 每 5 分钟一次
+ * （注意：cron 表达式里含斜杠，写在注释里会提前结束块注释，别直接抄）
+ * ===================================================================== */
+export async function retrygrading() {
+  try { await ensureConfig(); } catch (e) { /* 补不上就按原样跑 */ }
+  try {
+    const r = await qRetryAllDue(env, null);
+    console.log('[cron] retry-grading ' + JSON.stringify(r));
+    return r;
+  } catch (e) {
+    console.error('[cron] retry-grading 失败：' + ((e && e.message) || e));
+    return { ok: false, error: String((e && e.message) || e) };
+  }
 }
 
 Deno.serve(async (req) => {
