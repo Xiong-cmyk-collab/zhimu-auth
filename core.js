@@ -930,6 +930,21 @@ function qFillSetPair(stds, users) {
   return walk(0) ? perm : null;
 }
 
+/* ★ 填空题**部分分**（2026-11-24 用户要求改的）
+   原来：一空没答上就整题 0 分。用户反馈「填两个框错一个就全错不合理」。
+   现在：
+     · 2 个空：答对 1 个 = 1 分（每空 1 分）
+     · 3 个空及以上：每空 0.5 分
+     · **全对：给该题满分**（3 空全对也是满分 2 分，不是 1.5）
+   例：M9N「卫星系统」4 空，答对 2 个 = 1 分；PMU「引脚定义」4 空，错 1 个 = 1.5 分。 */
+function qFillPartialScore(hitCount, blankCount, maxScore) {
+  const max = Number(maxScore) || 0;
+  if (blankCount <= 0) return 0;
+  if (hitCount >= blankCount) return max;          /* 全对给满分 */
+  const per = (blankCount === 2) ? 1 : 0.5;         /* 每空分值 */
+  return Math.max(0, Math.min(max, hitCount * per));
+}
+
 /* ---------- 从模型输出里抠出 JSON ---------- */
 function qParseAiJson(raw) {
   let t = String(raw || '');
@@ -1303,7 +1318,6 @@ async function handleQSubmit(req, env) {
     if (q.type === 'fill') {
       const blanks = q.blanks || [];
       let sc = 0;
-      let allHit = true;
       const detail = [];
       /* 整题可信度 = 各空里最不确定的那个 */
       let conf = 1;
@@ -1324,19 +1338,21 @@ async function handleQSubmit(req, env) {
           }
         }
       }
+      let hitN = 0;
       for (let i = 0; i < blanks.length; i++) {
         const m = ms[i];
         /* 乱序命中时，按标准答案的次序显示考生的作答：
            「第 N 空」永远对应第 N 个标准，管理员一眼看得懂。 */
         const ju = perm ? userVals[perm[i]] : userVals[i];
-        if (m.hit) sc += blanks[i].points;
-        else allHit = false;
+        if (m.hit) hitN++;
         if (m.conf < conf) conf = m.conf;
         detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(ju || ''),
           hit: m.hit, conf: m.conf, how: m.how });
       }
-      /* ★ 填空题**整题计分**：有一空没答上（没填或没匹配），这题就是 0 分，不给部分分 */
-      if (!allHit) sc = 0;
+      /* ★ 填空题**部分分**（2026-11-24 用户要求）：
+         2 空答对 1 个 = 1 分；3 空及以上每空 0.5 分；全对给满分。
+         原来是一空没答上就整题 0 分。 */
+      sc = qFillPartialScore(hitN, blanks.length, q.score || 2);
       sc = Math.max(0, Math.min(sc, q.score || 2));
       auto[q.id] = { score: sc, max: q.score || 2, kind: 'fill', done: true, conf: conf, blanks: detail };
       autoScore += sc;
@@ -2298,6 +2314,66 @@ async function handleQAdminConfig(req, env, what) {
   };
   await env.KV.put(Q_AICFG, JSON.stringify(rec));
   return json({ ok: true, base: rec.base, model: rec.model, hasKey: !!rec.key });
+}
+
+/* POST /api/q/admin/quota —— 探查 AI 额度（**不消耗 request 配额**）
+   ★ 管理员点「立即重试 AI 判分」时先探一下，没额度就别白跑一趟。
+     走 MiniMax 官方的额度查询接口：
+       GET https://www.minimaxi.com/v1/token_plan/remains
+       - 走 **www** 主机（不是 api.*）
+       - 必须用**订阅 Key**（按量付费 Key 会被拒 → 退化成打一个最小请求试）
+       - 这个接口**不消耗**请求配额，可以随便探
+     返回 5 小时窗口 + 周窗口的剩余百分比。
+     2026-11-24 实测：控制台显示「5 小时已用 29%」，但 API 侧这个接口
+     返回 current_interval_status=2（已耗尽）、remaining_percent=0 →
+     控制台和 API 限流不是同一套口径，看控制台会误判。 */
+async function handleQAdminQuota(req, env) {
+  const admin = await isQuizAdmin(req, env);
+  if (!admin) return fail('需要管理员权限', 403);
+  const cfg = await qModelConfig(env);
+  if (!cfg.key) return json({ ok: true, hasQuota: false, source: 'none', reason: '还没配 AI 密钥' });
+
+  /* 1) 官方额度查询接口（不消耗配额，最准） */
+  const hosts = ['https://www.minimaxi.com', 'https://www.minimax.cn', 'https://www.minimax.io'];
+  for (const h of hosts) {
+    try {
+      const r = await fetch(h + '/v1/token_plan/remains', {
+        headers: { 'Authorization': 'Bearer ' + cfg.key }
+      });
+      const j = await r.json().catch(function () { return null; });
+      const br = j && j.base_resp;
+      if (!br || br.status_code !== 0) continue;      /* 这个 host 不认这个 key → 试下一个 */
+      const m = (j.model_remains || [])[0] || {};
+      const pct = (typeof m.current_interval_remaining_percent === 'number')
+        ? m.current_interval_remaining_percent : null;
+      const wPct = (typeof m.current_weekly_remaining_percent === 'number')
+        ? m.current_weekly_remaining_percent : null;
+      const exhausted = (m.current_interval_status === 2) || (pct != null && pct <= 0);
+      return json({
+        ok: true, hasQuota: !exhausted, source: 'token_plan',
+        intervalPercent: pct, intervalStatus: m.current_interval_status,
+        weeklyPercent: wPct,
+        resetAt: m.remains_time ? (Date.now() + m.remains_time) : 0
+      });
+    } catch (e) { /* 试下一个 host */ }
+  }
+
+  /* 2) 兜底：打一个最小请求试一下（按量付费 Key 走这条路） */
+  try {
+    const r = await fetch(cfg.base, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key },
+      body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: 'ok' }], max_tokens: 4, stream: false })
+    });
+    const j = await r.json().catch(function () { return {}; });
+    if (r.ok && j.choices && j.choices.length) {
+      return json({ ok: true, hasQuota: true, source: 'probe' });
+    }
+    const msg = (j.error && (j.error.message || j.error)) || ('HTTP ' + r.status);
+    return json({ ok: true, hasQuota: false, source: 'probe', reason: String(msg).slice(0, 200) });
+  } catch (e) {
+    return json({ ok: true, hasQuota: false, source: 'probe', reason: (e && e.message) || '网络异常' });
+  }
 }
 
 /* 站内通知接口：GET 读我的 / POST 标记已读 */
@@ -4057,6 +4133,7 @@ async function route(req, env) {
     if (p === '/api/q/admin/wrong-reset') return withJson(await handleQWrongReset(req, env), req, env);
     if (p === '/api/q/admin/qbank') return withJson(await handleQAdminConfig(req, env, 'qbank'), req, env);
     if (p === '/api/q/admin/aicfg') return withJson(await handleQAdminConfig(req, env, 'aicfg'), req, env);
+    if (p === '/api/q/admin/quota') return withJson(await handleQAdminQuota(req, env), req, env);
     if (p === '/api/q/ping')     return withJson(await handleQPing(req, env), req, env);
     if (p === '/api/q/logout')   return withJson(await handleQLogout(req, env), req, env);
     if (p === '/api/q/quiz/state') return withJson(await handleQQuizState(req, env), req, env);
