@@ -2422,7 +2422,19 @@ async function handleQNotices(req, env) {
     let b = {};
     try { b = await qReadBody(req); } catch (e) { b = {}; }
     const ids = Array.isArray(b.ids) ? b.ids.map(function (x) { return String(x); }) : null;
-    if (!ids || !ids.length) return fail('不支持清空全部通知，请逐条删除', 404);
+    /* ★ 不传 ids = **清除当前账号的全部通知**（用户 2026-11-24 明确要求的功能）。
+       范围只限**调用者自己**：key 是 qNotice(sess.name)，碰不到别人的通知。
+       （这个接口 2026-11-24 之前是 404「不支持清空」，
+         当时是因为用户觉得一键清空太粗暴、想找回某条没辙；
+         现在用户自己点名要这个功能，所以重新放开，并配一个二次确认弹窗。）
+       逐条删除（传 ids）照旧。 */
+    if (!ids) {
+      const n = arr.length;
+      if (!n) return json({ ok: true, removed: 0, left: 0, clearedAll: true });
+      await qNoticePut(env, key, []);
+      return json({ ok: true, removed: n, left: 0, clearedAll: true });
+    }
+    if (!ids.length) return fail('不支持清空全部通知，请逐条删除', 404);
     const keep = arr.filter(function (n) { return ids.indexOf(String(n.id)) < 0; });
     await qNoticePut(env, key, keep);
     return json({ ok: true, removed: arr.length - keep.length, left: keep.length });
