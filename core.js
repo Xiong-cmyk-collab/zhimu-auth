@@ -1375,7 +1375,15 @@ async function handleQFinish(req, env) {
     const g = aiAll[q.id];
     if (q.type === 'short') {
       shortCount++; shortMax += (q.score || 3);
-      if (g) {
+      /* ★★ 判据必须是「**判出来了**」，不是「有没有结果对象」。
+         AI 额度用尽/限流/超时时，g 照样存在（score=0, pending=true, needManual=true），
+         原来只判 `if (g)` → pending 永远是 0 →
+         ① rec.status 被错标成 pending_review（实际还有题没判）
+         ② qAfterGrading 被调用 → 这张卷子按「已判完 50 分」写进
+            成绩汇总 / 最好成绩 / 错题本，还发出一条「AI 建议得分 50/80」的假通知
+         ③ 前端显示「待判 0 道」，销售以为判完了
+         2026-11-24 实测：MiniMax 额度用尽时 10 道简答全被判成「已判完 0 分」。 */
+      if (g && !g.pending) {
         score += g.score; confSum += g.confidence; confN++;
         perQ[q.id] = { score: g.score, max: g.max, ai: true };
       } else {
@@ -1526,8 +1534,10 @@ async function qLiveSubIds(env) {
   } catch (e) { return null; }
 }
 
-/* 判分完成后：写进用户成绩记录 + 通知管理员 + 通知答题人 */
-async function qAfterGrading(env, rec, board) {
+/* 判分完成后：写进用户成绩记录 + 通知管理员 + 通知答题人
+   opts.skipAdminNotify=true：重判路径上管理员已经收到过一条通知了，别重复发。 */
+async function qAfterGrading(env, rec, board, opts) {
+  opts = opts || {};
   /* 写进用户自己的答题状态（这样「我的考试记录」里能看到） */
   try {
     const key = qState(rec.name);
@@ -1570,13 +1580,15 @@ async function qAfterGrading(env, rec, board) {
     if (u && u.enabled && (u.role === 'admin' || u.role === 'owner')) admins.push(u.name);
   }
   const low = rec.confidence != null && rec.confidence < 70;
-  for (const nm of admins) {
-    await qNotify(env, nm, low ? 'review_low' : 'review_new',
-      low ? '⚠ 有低可信度的判分待复核' : '有新的考试待复核',
-      rec.name + ' 刚提交了「' + rec.boardName + '」考试。AI 建议得分 ' + rec.finalScore
-      + ' / ' + rec.totalScore + '，整体可信度 ' + rec.confidence + '%。'
-      + (rec.shortCount ? rec.shortCount + ' 道简答题由 AI 判定，建议优先复核其中可信度偏低的几题。' : ''),
-      '#/review', rec.name);
+  if (!opts.skipAdminNotify) {
+    for (const nm of admins) {
+      await qNotify(env, nm, low ? 'review_low' : 'review_new',
+        low ? '⚠ 有低可信度的判分待复核' : '有新的考试待复核',
+        rec.name + ' 刚提交了「' + rec.boardName + '」考试。AI 建议得分 ' + rec.finalScore
+        + ' / ' + rec.totalScore + '，整体可信度 ' + rec.confidence + '%。'
+        + (rec.shortCount ? rec.shortCount + ' 道简答题由 AI 判定，建议优先复核其中可信度偏低的几题。' : ''),
+        '#/review', rec.name);
+    }
   }
   /* 通知答题人 */
   await qNotify(env, rec.name, 'grading_done', '等待管理员复核',
@@ -1777,19 +1789,39 @@ async function handleQReview(req, env, subId) {
   rec.review = { by: admin.name, at: Date.now() };
   await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
 
-  /* 同步更新用户成绩记录里的分数 */
+  /* 同步更新用户成绩记录里的分数
+     ★ 原来是「只在已有条目上 forEach 改分数」，条目不存在就什么都不做。
+       AI 挂掉时 finish 不写这条记录（还有题没判出来，分数没定），
+       于是管理员人工复核完的**最终分直接丢了** —— 考试次数/最好成绩/错题本都不动。
+       改成 upsert：条目不存在就补一条（错题本按复核后的逐题得分重算）。 */
   try {
     const key = qState(rec.name);
     const cur = (await env.KV.get(key, 'json')) || {};
     const st = (cur.state && typeof cur.state === 'object') ? cur.state : {};
-    if (Array.isArray(st.exams)) {
-      st.exams.forEach(function (e) {
-        if (e.subId === subId) { e.score = score; e.pending = false; e.reviewed = true; }
-      });
+    st.exams = Array.isArray(st.exams) ? st.exams : [];
+    let hit = -1;
+    for (let i = 0; i < st.exams.length; i++) {
+      if (st.exams[i] && st.exams[i].subId === subId) { hit = i; break; }
     }
-    if (st.best && st.best[rec.board]) {
-      const curBest = st.best[rec.board];
-      if (score > curBest.score) st.best[rec.board] = { score: score, total: rec.totalScore, at: rec.at };
+    if (hit >= 0) {
+      /* 已有条目：只改分数（错题本沿用判分时的口径，不动） */
+      st.exams[hit].score = score;
+      st.exams[hit].pending = false;
+      st.exams[hit].reviewed = true;
+    } else {
+      const wrong = qComputeWrong(rec, board);
+      st.exams.push({
+        at: rec.at, board: rec.board, boardName: rec.boardName,
+        score: score, total: rec.totalScore, usedMs: rec.usedMs,
+        subId: subId, pending: false, reviewed: true,
+        wrongIds: wrong.wrongIds, wrongPicks: wrong.wrongPicks
+      });
+      if (st.exams.length > 100) st.exams = st.exams.slice(-100);
+    }
+    st.best = st.best || {};
+    const curBest = st.best[rec.board];
+    if (!curBest || score > (Number(curBest.score) || 0)) {
+      st.best[rec.board] = { score: score, total: rec.totalScore, at: rec.at };
     }
     await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
       { expirationTtl: 60 * 60 * 24 * 365 });
@@ -1886,7 +1918,16 @@ async function qRetryAllDue(env, onlyName) {
     const r = await qRetryOne(env, rec, board, now);
     redone += r.done; remain += r.remain;
     await env.KV.put('q:sub:' + rec.id, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
-    if (r.done) touched.push({ id: rec.id, name: rec.name, board: rec.boardName, score: r.score, remain: r.remain });
+    /* ★★ 重判**全部成功** → 把成绩正式写进汇总（成绩记录/最好成绩/错题本/通知学生）。
+       为什么必须在这里补：AI 不可用时 finish 不调 qAfterGrading（还有题没判出来，
+       分数没定，不能写进成绩库）；如果重判成功后也没人补写，
+       这张卷子的成绩就**永远丢了** —— 交卷记录还在，但考试次数/最好成绩/错题本都不动。
+       skipAdminNotify：下面那段循环已经给管理员发过一条通知了，别重复发。 */
+    if (r.done && r.remain === 0 && rec.status !== 'reviewed') {
+      try { await qAfterGrading(env, rec, board, { skipAdminNotify: true }); }
+      catch (e) { /* 写成绩失败不影响重判流程 */ }
+    }
+    if (r.done) touched.push({ id: rec.id, name: rec.name, board: rec.boardName, score: rec.score, remain: r.remain });
   }
   /* 重判出分的，通知管理员去复核 */
   for (const t of touched) {
