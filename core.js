@@ -2333,47 +2333,74 @@ async function handleQAdminQuota(req, env) {
   const cfg = await qModelConfig(env);
   if (!cfg.key) return json({ ok: true, hasQuota: false, source: 'none', reason: '还没配 AI 密钥' });
 
-  /* 1) 官方额度查询接口（不消耗配额，最准） */
-  const hosts = ['https://www.minimaxi.com', 'https://www.minimax.cn', 'https://www.minimax.io'];
-  for (const h of hosts) {
-    try {
-      const r = await fetch(h + '/v1/token_plan/remains', {
-        headers: { 'Authorization': 'Bearer ' + cfg.key }
-      });
-      const j = await r.json().catch(function () { return null; });
-      const br = j && j.base_resp;
-      if (!br || br.status_code !== 0) continue;      /* 这个 host 不认这个 key → 试下一个 */
-      const m = (j.model_remains || [])[0] || {};
-      const pct = (typeof m.current_interval_remaining_percent === 'number')
-        ? m.current_interval_remaining_percent : null;
-      const wPct = (typeof m.current_weekly_remaining_percent === 'number')
-        ? m.current_weekly_remaining_percent : null;
-      const exhausted = (m.current_interval_status === 2) || (pct != null && pct <= 0);
-      return json({
-        ok: true, hasQuota: !exhausted, source: 'token_plan',
-        intervalPercent: pct, intervalStatus: m.current_interval_status,
-        weeklyPercent: wPct,
-        resetAt: m.remains_time ? (Date.now() + m.remains_time) : 0
-      });
-    } catch (e) { /* 试下一个 host */ }
-  }
+  /* ★★ 两个探针**并发**跑，谁先回来用谁；每个都**强制超时**。
+     2026-11-24 踩坑：原来是一个个 host 串行 fetch，而且**没设超时** →
+     Deno 边缘节点连 www.minimaxi.com 会挂住 → 整个请求卡死（前端 40 秒超时）。
+     现在：三条 host 并发 + 6 秒超时，兜底探针并发 + 12 秒超时，
+     整个接口最多 ~12 秒返回。 */
+  const withTimeout = async function (ms, fn) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { ctrl.abort(); }, ms);
+    try { return await fn(ctrl.signal); } finally { clearTimeout(timer); }
+  };
 
-  /* 2) 兜底：打一个最小请求试一下（按量付费 Key 走这条路） */
-  try {
-    const r = await fetch(cfg.base, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key },
-      body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: 'ok' }], max_tokens: 4, stream: false })
-    });
-    const j = await r.json().catch(function () { return {}; });
-    if (r.ok && j.choices && j.choices.length) {
-      return json({ ok: true, hasQuota: true, source: 'probe' });
+  /* 1) 官方额度查询接口（不消耗 request 配额，最准） */
+  const hosts = ['https://www.minimaxi.com', 'https://www.minimax.cn', 'https://www.minimax.io'];
+  const probeQuota = async function (h) {
+    try {
+      return await withTimeout(6000, async function (signal) {
+        const r = await fetch(h + '/v1/token_plan/remains', {
+          headers: { 'Authorization': 'Bearer ' + cfg.key }, signal: signal
+        });
+        const j = await r.json().catch(function () { return null; });
+        const br = j && j.base_resp;
+        if (!br || br.status_code !== 0) return null;   /* 这个 host 不认这个 key */
+        const m = (j.model_remains || [])[0] || {};
+        const pct = (typeof m.current_interval_remaining_percent === 'number')
+          ? m.current_interval_remaining_percent : null;
+        const wPct = (typeof m.current_weekly_remaining_percent === 'number')
+          ? m.current_weekly_remaining_percent : null;
+        const exhausted = (m.current_interval_status === 2) || (pct != null && pct <= 0);
+        return {
+          ok: true, hasQuota: !exhausted, source: 'token_plan',
+          intervalPercent: pct, intervalStatus: m.current_interval_status,
+          weeklyPercent: wPct,
+          resetAt: m.remains_time ? (Date.now() + m.remains_time) : 0
+        };
+      });
+    } catch (e) { return null; }
+  };
+
+  /* 2) 兜底：打一个最小请求试一下（按量付费 Key 走这条路，
+        也顺带确认 api.* 主机到底通不通） */
+  const probeChat = async function () {
+    try {
+      return await withTimeout(12000, async function (signal) {
+        const r = await fetch(cfg.base, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key },
+          body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: 'ok' }], max_tokens: 4, stream: false }),
+          signal: signal
+        });
+        const j = await r.json().catch(function () { return {}; });
+        if (r.ok && j.choices && j.choices.length) {
+          return { ok: true, hasQuota: true, source: 'probe' };
+        }
+        const msg = (j.error && (j.error.message || j.error)) || ('HTTP ' + r.status);
+        return { ok: true, hasQuota: false, source: 'probe', reason: String(msg).slice(0, 200) };
+      });
+    } catch (e) {
+      return { ok: true, hasQuota: false, source: 'probe', reason: (e && e.message) || '网络异常' };
     }
-    const msg = (j.error && (j.error.message || j.error)) || ('HTTP ' + r.status);
-    return json({ ok: true, hasQuota: false, source: 'probe', reason: String(msg).slice(0, 200) });
-  } catch (e) {
-    return json({ ok: true, hasQuota: false, source: 'probe', reason: (e && e.message) || '网络异常' });
-  }
+  };
+
+  const [quotaHits, chatRes] = await Promise.all([
+    Promise.all(hosts.map(probeQuota)),
+    probeChat()
+  ]);
+  const q = quotaHits.find(function (x) { return !!x; });
+  if (q) return json(q);
+  return json(chatRes || { ok: true, hasQuota: false, source: 'none', reason: '额度探查失败' });
 }
 
 /* 站内通知接口：GET 读我的 / POST 标记已读 */
