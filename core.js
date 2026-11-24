@@ -1287,6 +1287,120 @@ function qFindQ(board, qid) {
   return null;
 }
 
+/* ---------- 系列：几个板块合成一个「系列产品」（2026-11-24 用户要求） ---------- */
+function qFindSeries(qb, id) {
+  if (!qb || !Array.isArray(qb.series)) return null;
+  for (const s of qb.series) if (s.id === id) return s;
+  return null;
+}
+function qSeriesBoards(qb, series) {
+  const ids = (series && series.boards) || [];
+  const out = [];
+  for (const id of ids) {
+    const b = qFindBoard(qb, id);
+    if (b) out.push(b);
+  }
+  return out;
+}
+/* Fisher-Yates 洗牌 */
+function qShuffle(a) {
+  const r = a.slice();
+  for (let i = r.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = r[i]; r[i] = r[j]; r[j] = t;
+  }
+  return r;
+}
+/* 显示用名：系列里的板块显示成「<系列名>产品·<板块名>」
+   例：开源系统产品·V6X飞控控制器（用户 2026-11-24 明确要求这个写法） */
+function qBoardLabel(qb, board) {
+  if (!board) return '';
+  const s = board.series ? qFindSeries(qb, board.series) : null;
+  if (!s) return board.name;
+  return s.name + '产品·' + board.name;
+}
+/* ★ 组一份系列考试卷：跨系列里所有板块，按题型各抽 N 道（题量/分值来自系列配置）。
+   每道题记 id / boardId / type / score —— score 用**系列配置的分值**，不是板块原分值。 */
+function qComposeSeriesPaper(qb, series) {
+  const boards = qSeriesBoards(qb, series);
+  const ex = (series && series.exam) || {};
+  const nC = Number(ex.choice) || 0, nF = Number(ex.fill) || 0, nS = Number(ex.short) || 0;
+  const sC = Number(ex.scoreChoice) || 1, sF = Number(ex.scoreFill) || 2, sS = Number(ex.scoreShort) || 3;
+  const pool = { choice: [], fill: [], short: [] };
+  for (const b of boards) {
+    for (const q of (b.questions || [])) {
+      if (q.type === 'choice') pool.choice.push({ q: q, boardId: b.id });
+      else if (q.type === 'fill') pool.fill.push({ q: q, boardId: b.id });
+      else pool.short.push({ q: q, boardId: b.id });
+    }
+  }
+  const items = [];
+  let seq = 0;
+  const push = function (arr, score) {
+    for (const it of arr) {
+      seq++;
+      items.push({ id: it.q.id, boardId: it.boardId, type: it.q.type, score: score, seq: seq });
+    }
+  };
+  push(qShuffle(pool.choice).slice(0, nC), sC);
+  push(qShuffle(pool.fill).slice(0, nF), sF);
+  push(qShuffle(pool.short).slice(0, nS), sS);
+  return {
+    items: items,
+    total: items.reduce(function (a, x) { return a + x.score; }, 0),
+    minutes: Number(ex.minutes) || 60
+  };
+}
+
+/* 一条考试记录对应的「卷子」：
+   普通板块 = 该板块的全部题；系列考试 = rec.paper 里抽出来的那 80 道（跨多个板块）。
+   返回 [{ q, score, boardId }]，score 是**这道题在本卷里的分值**。 */
+function qRecItems(rec, qb) {
+  if (rec && Array.isArray(rec.paper) && rec.paper.length) {
+    const out = [];
+    for (const it of rec.paper) {
+      const b = qFindBoard(qb, it.boardId);
+      const q = b ? qFindQ(b, it.id) : null;
+      if (q) out.push({ q: q, score: it.score, boardId: it.boardId });
+    }
+    return out;
+  }
+  const b = qFindBoard(qb, rec && rec.board);
+  return ((b && b.questions) || []).map(function (q) {
+    return { q: q, score: q.score, boardId: b.id };
+  });
+}
+
+/* POST /api/q/paper —— 组一份「系列考试卷」。
+   ★ 为什么组卷放服务器：组卷规则（各抽多少道、总分多少）是**考试规则**，
+     前端组 = 前端决定考什么；服务器组 → 规则在服务器，前端只照着渲染。
+   卷子先落 KV（q:paper:<id>，3 小时过期），交卷时带 paperId 回来。 */
+async function handleQPaper(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const sess = await getQuizSession(req, env);
+  if (!sess) return fail('登录已失效，请重新登录', 401);
+  let b;
+  try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
+  const qb = await qLoadQbank(env);
+  if (!qb) return fail('题库尚未同步到服务器，请联系管理员', 503);
+  const series = qFindSeries(qb, String(b.series || '').trim());
+  if (!series) return fail('没有这个系列', 404);
+  const paper = qComposeSeriesPaper(qb, series);
+  if (!paper.items.length) return fail('题库里没有可用的题目', 400);
+  const paperId = token().slice(0, 16);
+  await env.KV.put('q:paper:' + paperId, JSON.stringify({
+    id: paperId, name: sess.name, series: series.id, items: paper.items,
+    total: paper.total, minutes: paper.minutes, at: Date.now()
+  }), { expirationTtl: 3 * 60 * 60 });
+  return json({
+    ok: true, paperId: paperId, items: paper.items, total: paper.total,
+    minutes: paper.minutes,
+    totalScore: Number((series.exam || {}).totalScore) || paper.total,
+    name: series.name + '产品·系列综合考试'
+  });
+}
+
 /* POST /api/q/submit —— 交卷：程序判选择/填空，简答题留给 AI */
 async function handleQSubmit(req, env) {
   const bad = assertSameOrigin(req, env);
@@ -1297,22 +1411,43 @@ async function handleQSubmit(req, env) {
   let b;
   try { b = await qReadBody(req); } catch (e) { return fail('请求体不是合法 JSON'); }
   const boardId = String(b.board || '').trim();
+  const paperId = String(b.paperId || '').trim();
   const answers = (b.answers && typeof b.answers === 'object') ? b.answers : {};
   const usedMs = Math.max(0, Number(b.usedMs) || 0);
 
   const qb = await qLoadQbank(env);
   if (!qb) return fail('题库尚未同步到服务器，请联系管理员', 503);
-  const board = qFindBoard(qb, boardId);
-  if (!board) return fail('没有这个板块', 404);
+
+  /* ★ 系列考试：卷子是**服务器组好**的（POST /q/paper），交卷时带 paperId 回来。
+     普通板块考试：卷子就是这个板块的全部题。 */
+  let paper = null;
+  if (paperId) {
+    paper = await env.KV.get('q:paper:' + paperId, 'json');
+    if (!paper || paper.name !== sess.name) return fail('试卷已失效，请重新开始考试', 410);
+  }
+  const board = paper ? null : qFindBoard(qb, boardId);
+  if (!paper && !board) return fail('没有这个板块', 404);
+
+  /* 卷子清单：[{ q, score, boardId }] */
+  const items = paper
+    ? paper.items.map(function (it) {
+        const bb = qFindBoard(qb, it.boardId);
+        const q = bb ? qFindQ(bb, it.id) : null;
+        return q ? { q: q, score: it.score, boardId: it.boardId } : null;
+      }).filter(function (x) { return !!x.q; })
+    : (board.questions || []).map(function (q) { return { q: q, score: q.score, boardId: board.id }; });
+  if (!items.length) return fail('试卷是空的，请重新开始考试', 400);
 
   const auto = {};     /* 程序判的：选择题 / 填空题 */
   const needGrade = []; /* 要 AI 判的：简答题 */
   let autoScore = 0;
-  for (const q of (board.questions || [])) {
+  for (const it of items) {
+    const q = it.q;
+    const qScore = it.score || q.score || 0;   /* 系列考试用系列配置的分值 */
     const raw = answers[q.id];
     if (q.type === 'short') {
       needGrade.push(q.id);
-      auto[q.id] = { score: 0, max: q.score || 3, kind: 'short', done: false };
+      auto[q.id] = { score: 0, max: qScore, kind: 'short', done: false };
       continue;
     }
     if (q.type === 'fill') {
@@ -1352,9 +1487,9 @@ async function handleQSubmit(req, env) {
       /* ★ 填空题**部分分**（2026-11-24 用户要求）：
          2 空答对 1 个 = 1 分；3 空及以上每空 0.5 分；全对给满分。
          原来是一空没答上就整题 0 分。 */
-      sc = qFillPartialScore(hitN, blanks.length, q.score || 2);
-      sc = Math.max(0, Math.min(sc, q.score || 2));
-      auto[q.id] = { score: sc, max: q.score || 2, kind: 'fill', done: true, conf: conf, blanks: detail };
+      sc = qFillPartialScore(hitN, blanks.length, qScore || 2);
+      sc = Math.max(0, Math.min(sc, qScore || 2));
+      auto[q.id] = { score: sc, max: qScore || 2, kind: 'fill', done: true, conf: conf, blanks: detail };
       autoScore += sc;
       continue;
     }
@@ -1367,21 +1502,32 @@ async function handleQSubmit(req, env) {
       else if (/^[0-3]$/.test(s)) pick = parseInt(s, 10);
     }
     const ok = pick === q.answer;
-    const sc = ok ? (q.score || 1) : 0;
-    auto[q.id] = { score: sc, max: q.score || 1, kind: 'choice', done: true, pick: pick, right: ok };
+    const sc = ok ? (qScore || 1) : 0;
+    auto[q.id] = { score: sc, max: qScore || 1, kind: 'choice', done: true, pick: pick, right: ok };
     autoScore += sc;
   }
 
   const subId = token().slice(0, 20);
-  const totalScore = (board.totalScore || (board.questions || []).reduce(function (a, q) { return a + (q.score || 0); }, 0));
+  /* 总分：普通板块 = 板块总分；系列考试 = 这份卷子的题分之和（65×1 + 10×2 + 5×3 = 100） */
+  const totalScore = items.reduce(function (a, it) { return a + (it.score || 0); }, 0);
+  /* 显示名：系列里的板块 → 「开源系统产品·V6X飞控控制器」（用户 2026-11-24 指定的写法） */
+  const series = paper ? qFindSeries(qb, paper.series) : null;
+  const boardName = paper
+    ? (series ? (series.name + '产品·系列综合考试') : '系列综合考试')
+    : qBoardLabel(qb, board);
   const rec = {
-    id: subId, name: sess.name, board: boardId, boardName: board.name,
+    id: subId, name: sess.name,
+    board: paper ? (paper.series || boardId) : boardId,
+    boardName: boardName,
     at: Date.now(), usedMs: usedMs, totalScore: totalScore,
     answers: answers, auto: auto, ai: {},
+    /* ★ 系列考试：把卷子存进记录，后面汇总/明细/复核都按它来 */
+    paper: paper ? paper.items : null,
     status: needGrade.length ? 'grading' : 'pending_review',
     finalScore: null, confidence: null
   };
   await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  if (paper) { try { await env.KV.delete('q:paper:' + paper.id); } catch (e) { /* 用完即删 */ } }
 
   if (!needGrade.length) {
     /* 没有简答题 → 直接进入待复核 */
@@ -1414,7 +1560,13 @@ async function handleQGradeOne(req, env) {
 
   const qb = await qLoadQbank(env);
   const board = qFindBoard(qb, rec.board);
-  const q = qFindQ(board, qid);
+  /* ★ 系列考试：题在 rec.paper 里（跨多个板块），rec.board 是系列 id → 板块查不到，
+     得按卷子清单找题，否则 grade-one 会报「题目不存在」。 */
+  let q = qFindQ(board, qid);
+  if (!q) {
+    const items = qRecItems(rec, qb);
+    for (const it of items) { if (it.q.id === qid) { q = it.q; break; } }
+  }
   if (!q) return fail('题目不存在', 404);
 
   const raw = rec.answers ? rec.answers[qid] : '';
@@ -1452,18 +1604,22 @@ async function handleQFinish(req, env) {
 
   const qb = await qLoadQbank(env);
   const board = qFindBoard(qb, rec.board);
+  /* ★ 卷子清单：普通板块 = 板块全部题；系列考试 = rec.paper 里那 80 道 */
+  const items = qRecItems(rec, qb);
 
   let score = 0, confSum = 0, confN = 0, shortCount = 0, shortMax = 0, pending = 0;
   const perQ = {};
   /* ★ 汇总时按题读**独立 key**，避免并发写入互相覆盖导致的「丢结果」 */
-  const shortIds = ((board && board.questions) || []).filter(function (q) { return q.type === 'short'; })
-    .map(function (q) { return q.id; });
+  const shortIds = items.filter(function (it) { return it.q.type === 'short'; })
+    .map(function (it) { return it.q.id; });
   const aiAll = await qGatherAi(env, subId, shortIds, rec.ai);
-  for (const q of ((board && board.questions) || [])) {
+  for (const it of items) {
+    const q = it.q;
+    const qScore = it.score || q.score || 0;
     const a = rec.auto && rec.auto[q.id];
     const g = aiAll[q.id];
     if (q.type === 'short') {
-      shortCount++; shortMax += (q.score || 3);
+      shortCount++; shortMax += qScore || 3;
       /* ★★ 判据必须是「**判出来了**」，不是「有没有结果对象」。
          AI 额度用尽/限流/超时时，g 照样存在（score=0, pending=true, needManual=true），
          原来只判 `if (g)` → pending 永远是 0 →
@@ -1477,13 +1633,13 @@ async function handleQFinish(req, env) {
         perQ[q.id] = { score: g.score, max: g.max, ai: true };
       } else {
         pending++;
-        perQ[q.id] = { score: 0, max: q.score || 3, ai: true, pending: true };
+        perQ[q.id] = { score: 0, max: qScore || 3, ai: true, pending: true };
       }
     } else if (a) {
       score += a.score;
       /* ★ 每题分也要记进 perQ —— 只写 short 分支的话，
         选择题/填空题在用户明细里得分显示成「—」（final=null）。 */
-      perQ[q.id] = { score: a.score, max: q.score || 0 };
+      perQ[q.id] = { score: a.score, max: qScore || 0 };
     }
   }
   const confidence = confN ? Math.round((confSum / confN) * 100) : 100;
@@ -1528,21 +1684,29 @@ async function qUserNames(env) {
    ★ 口径必须跟前端 markWrong 一致：
      - 选择题：**未作答不算错**（前端只在 picked != null && picked !== answer 时 markWrong）
      - 填空题：整题计分，0 分就是没答全 → 算错
-     - 简答题：没拿满分 → 算错（但简答/填空**不进错题本**，前端只对选择题 markWrong） */
-function qComputeWrong(rec, board) {
+     - 简答题：没拿满分 → 算错（但简答/填空**不进错题本**，前端只对选择题 markWrong）
+   ★ 系列考试（rec.paper）的卷子跨多个板块 → 传 items 进来，
+     不然只能算第一个板块的题。 */
+function qComputeWrong(rec, board, items) {
   const wrongIds = [], wrongPicks = {};
-  for (const q of ((board && board.questions) || [])) {
+  /* ★ 系列考试（rec.paper）的卷子跨多个板块 → 用 rec.paper 里的题型/分值。
+     不需要题库：paper 项本身就带 id/type/score，auto/perQ 里也有每题得分。 */
+  const list = items || (rec && Array.isArray(rec.paper) && rec.paper.length
+    ? rec.paper.map(function (it) { return { q: { id: it.id, type: it.type, score: it.score }, score: it.score }; })
+    : ((board && board.questions) || []).map(function (q) { return { q: q, score: q.score }; }));
+  for (const it of list) {
+    const q = it.q || it;
     const a = (rec.auto && rec.auto[q.id]) || null;
     const pq = (rec.perQ && rec.perQ[q.id]) || null;
     if (q.type === 'short') {
       const got = pq ? (Number(pq.score) || 0) : 0;
-      const max = pq ? (Number(pq.max) || 0) : (q.score || 3);
+      const max = pq ? (Number(pq.max) || 0) : (it.score || q.score || 3);
       if (max > 0 && got < max) wrongIds.push(q.id);
       continue;
     }
     if (q.type === 'fill') {
       const got = a ? (Number(a.score) || 0) : 0;
-      const max = a ? (Number(a.max) || 0) : (q.score || 0);
+      const max = a ? (Number(a.max) || 0) : (it.score || q.score || 0);
       if (max > 0 && got < max) wrongIds.push(q.id);
       continue;
     }
@@ -1580,8 +1744,10 @@ function qSyncAfterExamRemoved(st, rec, board) {
   if (st.wrong && typeof st.wrong === 'object') {
     const w = qComputeWrong(rec, board);
     const choiceIds = {};
-    for (const q of ((board && board.questions) || [])) {
-      if (q.type === 'choice') choiceIds[q.id] = 1;
+    if (rec && Array.isArray(rec.paper) && rec.paper.length) {
+      for (const it of rec.paper) if (it.type === 'choice') choiceIds[it.id] = 1;
+    } else {
+      for (const q of ((board && board.questions) || [])) if (q.type === 'choice') choiceIds[q.id] = 1;
     }
     for (const qid of w.wrongIds) {
       if (!choiceIds[qid]) continue;
@@ -1724,13 +1890,21 @@ async function handleQSubmissions(req, env, path, subId) {
       if (r.id !== subId) continue;
       const board = qFindBoard(qb, r.board);
       const detail = {};
+      /* ★ 卷子清单：普通板块 = 板块全部题；系列考试 = rec.paper 里那 80 道（跨三个板块） */
+      const items = qRecItems(r, qb);
       /* ★ 同上：逐题读独立 key */
-      const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+      const ids = items.map(function (it) { return it.q.id; });
       const aiAll = await qGatherAi(env, r.id, ids, r.ai);
-      for (const q of ((board && board.questions) || [])) {
+      for (const it of items) {
+        const q = it.q;
+        const qScore = it.score || q.score || 0;
         detail[q.id] = {
           no: q.no, seq: (q.seq != null) ? q.seq : q.no,
-          type: q.type, stem: q.stem, score: q.score,
+          type: q.type, stem: q.stem, score: qScore,
+          /* ★ 来源板块：系列考试里每道题标「开源系统产品·V6X飞控控制器」
+             （用户 2026-11-24 要求每题标出是哪个板块的） */
+          boardId: it.boardId || (board && board.id) || null,
+          boardLabel: qBoardLabel(qb, qFindBoard(qb, it.boardId || (board && board.id))),
           options: q.options || null, reference: q.reference || null,
           points: q.points || null,
           /* ★ blanks 要给**考生作答**（含标准答案/填写内容/命中与否/每空可信度），
@@ -1754,7 +1928,7 @@ async function handleQSubmissions(req, env, path, subId) {
             : (q.type === 'short'
               ? ((aiAll[q.id] && typeof aiAll[q.id].score === 'number') ? aiAll[q.id].score : null)
               : ((r.auto && r.auto[q.id] && typeof r.auto[q.id].score === 'number') ? r.auto[q.id].score : null)),
-          max: q.score || 0,
+          max: qScore || 0,
           answered: qAnswered(r, q),
           /* ★ pick：考生选了第几项。
              答题卡/全卷里要标出「他选的是哪个」，
@@ -1801,8 +1975,10 @@ async function handleQSubDelete(req, env, subId) {
          前端等得以为没删掉（列表不刷新）。 */
     const qb = await qLoadQbank(env);
     board = qFindBoard(qb, rec.board);
-    const dels = ((board && board.questions) || []).map(function (q) {
-      return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
+    /* ★ 系列考试的卷子跨多个板块 → 用卷子清单取题 id，别只按第一个板块删 */
+    const qids = qRecItems(rec, qb).map(function (it) { return it.q.id; });
+    const dels = qids.map(function (qid) {
+      return env.KV.delete(qAiKey(subId, qid)).catch(function () { });
     });
     await Promise.all(dels);
     await env.KV.delete(key);
@@ -1854,22 +2030,26 @@ async function handleQReview(req, env, subId) {
   const board = qFindBoard(qb, rec.board);
   const finalPer = {};
   let score = 0;
-  const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+  /* ★ 卷子清单：普通板块 = 板块全部题；系列考试 = rec.paper 里那 80 道 */
+  const items = qRecItems(rec, qb);
+  const ids = items.map(function (it) { return it.q.id; });
   const aiAll = await qGatherAi(env, subId, ids, rec.ai);
-  for (const q of ((board && board.questions) || [])) {
+  for (const it of items) {
+    const q = it.q;
+    const qScore = it.score || q.score || 0;
     const a = rec.auto && rec.auto[q.id];
     const g = aiAll[q.id];
     let sc = null;
     if (Object.prototype.hasOwnProperty.call(perQ, q.id)) {
       const v = Number(perQ[q.id]);
-      if (Number.isFinite(v)) sc = Math.max(0, Math.min(v, q.score || 0));
+      if (Number.isFinite(v)) sc = Math.max(0, Math.min(v, qScore || 0));
     }
     if (sc == null) {
       if (g) sc = g.score;
       else if (a) sc = a.score;
       else sc = 0;
     }
-    finalPer[q.id] = { score: sc, max: q.score || 0 };
+    finalPer[q.id] = { score: sc, max: qScore || 0 };
     score += sc;
   }
   rec.perQ = finalPer;
@@ -1933,10 +2113,11 @@ const Q_RETRY_TOTAL_BUDGET_MS = 120000;        /* ★ 整轮（所有记录加�
                                                 force 模式一次可能扫十几份记录，
                                                 不设总预算会跑到一半前端就报超时。 */
 
-async function qRetryOne(env, rec, board, now, deadline) {
+async function qRetryOne(env, rec, board, now, deadline, qb) {
   const pend = (rec.pendingAi || []).slice();
   if (!pend.length) return { done: 0, remain: 0, ok: true };
-  const qs = ((board && board.questions) || []).filter(function (q) {
+  /* ★ 系列考试的卷子跨多个板块 → board 查不到，按卷子清单取题（要真题目：题干/得分点要喂给模型） */
+  const qs = qRecItems(rec, qb).map(function (it) { return it.q; }).filter(function (q) {
     return pend.indexOf(q.id) >= 0;
   });
   let done = 0;
@@ -1975,12 +2156,17 @@ async function qRetryOne(env, rec, board, now, deadline) {
   }
   rec.pendingAi = still;
 
-  /* 重新汇总总分与可信度 */
-  const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+  /* 重新汇总总分与可信度
+     ★ 系列考试的卷子跨多个板块 → 必须按卷子清单（items）汇总，
+       否则 board 为空 → 分数被算成 0。 */
+  const items = qRecItems(rec, qb);
+  const ids = items.map(function (it) { return it.q.id; });
   const aiAll = await qGatherAi(env, rec.id, ids, rec.ai);
   let score = 0, confSum = 0, confN = 0;
   const perQ = {};
-  for (const q of ((board && board.questions) || [])) {
+  for (const it of items) {
+    const q = it.q;
+    const qScore = it.score || q.score || 0;
     const a = rec.auto && rec.auto[q.id];
     const g = aiAll[q.id];
     let sc = 0;
@@ -1989,7 +2175,7 @@ async function qRetryOne(env, rec, board, now, deadline) {
       /* 只对 AI 真正判过的题取平均（未作答的不算） */
       if (g && g.graded !== false) { confSum += g.confidence; confN++; }
     } else if (a) sc = a.score;
-    perQ[q.id] = { score: sc, max: q.score || 0 };
+    perQ[q.id] = { score: sc, max: qScore || 0 };
     score += sc;
   }
   rec.perQ = perQ;
@@ -2031,7 +2217,7 @@ async function qRetryAllDue(env, onlyName, force) {
     if (Date.now() > deadline) { budgetOut++; continue; }   /* 整轮预算用完，剩下下轮再说 */
     due++;
     const board = qFindBoard(qb, rec.board);
-    const r = await qRetryOne(env, rec, board, now, deadline);
+    const r = await qRetryOne(env, rec, board, now, deadline, qb);
     redone += r.done; remain += r.remain;
     await env.KV.put('q:sub:' + rec.id, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
     /* ★★ 重判**全部成功** → 把成绩正式写进汇总（成绩记录/最好成绩/错题本/通知学生）。
@@ -2130,8 +2316,10 @@ async function handleQMySubDelete(req, env, subId) {
   /* 明细 + 每题的 AI 判定（有才删） */
   const qb = await qLoadQbank(env);
   const board = qFindBoard(qb, rec ? rec.board : null);
-  const dels = ((board && board.questions) || []).map(function (q) {
-    return env.KV.delete(qAiKey(subId, q.id)).catch(function () { });
+  /* ★ 系列考试的卷子跨多个板块 → 用卷子清单取题 id */
+  const qids = rec ? qRecItems(rec, qb).map(function (it) { return it.q.id; }) : [];
+  const dels = qids.map(function (qid) {
+    return env.KV.delete(qAiKey(subId, qid)).catch(function () { });
   });
   await Promise.all(dels);
   try { await env.KV.delete(key); } catch (e) { /* 忽略 */ }
@@ -2173,15 +2361,22 @@ async function handleQMySubDetail(req, env, subId) {
   const qb = await qLoadQbank(env);
   const board = qFindBoard(qb, rec.board);
   const detail = {};
-  const ids = ((board && board.questions) || []).map(function (q) { return q.id; });
+  /* ★ 卷子清单：普通板块 = 板块全部题；系列考试 = rec.paper 里那 80 道（跨三个板块） */
+  const items = qRecItems(rec, qb);
+  const ids = items.map(function (it) { return it.q.id; });
   const aiAll = await qGatherAi(env, subId, ids, rec.ai);
-  for (const q of ((board && board.questions) || [])) {
+  for (const it of items) {
+    const q = it.q;
+    const qScore = it.score || q.score || 0;
     const a = (rec.auto && rec.auto[q.id]) || null;
     const g = aiAll[q.id] || null;
     const fin = (rec.perQ && rec.perQ[q.id]) ? rec.perQ[q.id] : null;
     const item = {
       no: q.no, seq: (q.seq != null) ? q.seq : q.no,
-      type: q.type, stem: q.stem, score: q.score,
+      type: q.type, stem: q.stem, score: qScore,
+      /* ★ 来源板块标签：系列考试里每题标「开源系统产品·V6X飞控控制器」 */
+      boardId: it.boardId || (board && board.id) || null,
+      boardLabel: qBoardLabel(qb, qFindBoard(qb, it.boardId || (board && board.id))),
       /* ★ 每题可信度（与管理员那边同一个口径） */
       conf: (q.type === 'short')
         ? ((g && typeof g.confidence === 'number') ? g.confidence : null)
@@ -2193,7 +2388,7 @@ async function handleQMySubDetail(req, env, subId) {
         : (q.type === 'short'
           ? ((g && typeof g.score === 'number') ? g.score : null)
           : ((a && typeof a.score === 'number') ? a.score : null)),
-      max: q.score || 0,
+      max: qScore || 0,
       /* ★ 有没有作答：答题卡里「白」的判定（用户 2026-11-24 要求） */
       answered: qAnswered(rec, q),
       options: q.options || null,
@@ -4152,6 +4347,7 @@ async function route(req, env) {
     if (p === '/api/q/retry-mine') return withJson(await handleQRetryGrading(req, env, true), req, env);
     if (p === '/api/q/admin/retry-grading') return withJson(await handleQRetryGrading(req, env, false), req, env);
     if (p === '/api/q/submit')   return withJson(await handleQSubmit(req, env), req, env);
+    if (p === '/api/q/paper')    return withJson(await handleQPaper(req, env), req, env);
     if (p === '/api/q/grade-one') return withJson(await handleQGradeOne(req, env), req, env);
     if (p === '/api/q/finish')  return withJson(await handleQFinish(req, env), req, env);
     if (p === '/api/q/my/subs') return withJson(await handleQMySubs(req, env), req, env);
