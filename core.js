@@ -876,6 +876,60 @@ function qFillMatch(std, user) {
   return { hit: false, conf: 0.5, how: '不匹配' };
 }
 
+/* ---------- 填空题「顺序可打乱」 ---------- */
+/* 用户 2026-11-24 提的需求：像「M9N 支持的卫星系统是 ___、___、___ 和 ___」
+   这种列举型填空题，考生把答案打乱写（Galileo、GPS、BeiDou、GLONASS）也算对。
+   ★ 判据：**题干里相邻两个空之间只允许出现枚举连接词**（、/或/和/与/及），
+     且各空的标准答案互不相同 → 这是「列举型」，顺序无意义。
+   为什么不能用「有顿号就算」：PMU「6 针线束引脚定义：第 1、2 针是 ___，
+   第 3 针是 ___，第 4 针是 ___，第 5、6 针是 ___」也有顿号，
+   但每个空都绑死了具体针脚，顺序是有意义的 —— 那种题必须按位置判。
+   2026-11-24 实测：三个板块一共 18 道多空填空题，按这个判据
+   精确命中 2 道（V6X「通过 ___ 或 ___ 接口」、M9N「支持的卫星系统」），
+   其余 16 道（温度范围、尺寸、针脚定义、电流电压…）全部正确排除。 */
+const Q_ENUM_SEP = /^[、，,和与及或()（）\s]*(?:以及|或者|或|和|与|及|、)[、，,和与及或()（）\s]*$/;
+
+function qFillOrderFree(q) {
+  const blanks = (q && q.blanks) || [];
+  if (blanks.length < 2) return false;
+  const answers = blanks.map(function (b) { return String((b && b.answer) || '').trim(); });
+  if (answers.some(function (a) { return !a; })) return false;
+  /* 标准答案有重复 → 不能乱序（否则「5V、5V、GND」这种会被判乱） */
+  if (new Set(answers).size !== answers.length) return false;
+  const stem = String((q && q.stem) || '');
+  const parts = stem.split(/_{3,}/);
+  if (parts.length - 1 !== blanks.length) return false;
+  for (let i = 0; i < blanks.length - 1; i++) {
+    if (!Q_ENUM_SEP.test(parts[i + 1])) return false;
+  }
+  return true;
+}
+
+/* 给「顺序可打乱」的填空题做**内容集合匹配**：
+   找一组排列，让第 i 个标准答案能对上考生答案里的某一个。
+   找不到完美匹配就返回 null（按位置判，该错就错）。
+   返回 perm：perm[i] = 第 i 个标准答案对应考生第几个空（-1 = 没配上）。 */
+function qFillSetPair(stds, users) {
+  const n = stds.length;
+  if (users.length !== n) return null;
+  const used = new Array(n).fill(false);
+  const perm = new Array(n).fill(-1);
+  function walk(i) {
+    if (i >= n) return true;
+    for (let j = 0; j < n; j++) {
+      if (used[j]) continue;
+      const u = users[j];
+      if (!String(u == null ? '' : u).trim()) continue;
+      if (!qFillMatch(stds[i], u).hit) continue;
+      used[j] = true; perm[i] = j;
+      if (walk(i + 1)) return true;
+      used[j] = false; perm[i] = -1;
+    }
+    return false;
+  }
+  return walk(0) ? perm : null;
+}
+
 /* ---------- 从模型输出里抠出 JSON ---------- */
 function qParseAiJson(raw) {
   let t = String(raw || '');
@@ -1253,13 +1307,32 @@ async function handleQSubmit(req, env) {
       const detail = [];
       /* 整题可信度 = 各空里最不确定的那个 */
       let conf = 1;
+      const userVals = blanks.map(function (b, i) {
+        return raw && typeof raw === 'object' ? (raw['b' + (i + 1)] || '') : '';
+      });
+      const ms = userVals.map(function (u, i) { return qFillMatch(blanks[i].answer, u); });
+      const allHitPos = ms.every(function (m) { return m.hit; });
+      let perm = null;     /* perm[i] = 第 i 个标准答案对应考生第几空 */
+      /* ★ 列举型填空题：顺序可以打乱。
+         位置没对上，但内容能一一配起来（集合一致）→ 也算全对。
+         例：标准 GPS/GLONASS/BeiDou/Galileo，考生写 Galileo/GPS/BeiDou/GLONASS。 */
+      if (!allHitPos && qFillOrderFree(q)) {
+        perm = qFillSetPair(blanks.map(function (b) { return b.answer; }), userVals);
+        if (perm) {
+          for (let i = 0; i < blanks.length; i++) {
+            if (perm[i] >= 0) ms[i] = { hit: true, conf: 1, how: '乱序命中' };
+          }
+        }
+      }
       for (let i = 0; i < blanks.length; i++) {
-        const user = raw && typeof raw === 'object' ? (raw['b' + (i + 1)] || '') : '';
-        const m = qFillMatch(blanks[i].answer, user);
+        const m = ms[i];
+        /* 乱序命中时，按标准答案的次序显示考生的作答：
+           「第 N 空」永远对应第 N 个标准，管理员一眼看得懂。 */
+        const ju = perm ? userVals[perm[i]] : userVals[i];
         if (m.hit) sc += blanks[i].points;
         else allHit = false;
         if (m.conf < conf) conf = m.conf;
-        detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(user || ''),
+        detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(ju || ''),
           hit: m.hit, conf: m.conf, how: m.how });
       }
       /* ★ 填空题**整题计分**：有一空没答上（没填或没匹配），这题就是 0 分，不给部分分 */
