@@ -858,9 +858,11 @@ function qFillMatch(std, user) {
   const alias = Q_ANSWER_ALIAS[a];
   if (alias && alias.indexOf(b) >= 0) return { hit: true, conf: 1, how: '同义词命中' };
   /* 数字近似：两边数字个数相同且逐个相对误差 ≤1%
-     ★★ **去掉数字后的文字必须完全相等** —— 只比数字的话，
+     ★★ 去掉数字后的文字必须**一致或互为后缀** —— 只比数字的话，
        「TELEM1」和「CAN 1」会判成命中（数字都是 1）→ 白送分。
        2026-11-24 实测踩到过：标准答案 TELEM1，考生写 CAN 1，直接拿了满分。
+       但也不能要求文字**完全相等**：学生答得啰嗦但意思对很常见
+       （标准「PWM数量为16路」→ 答「16路」）→ 放宽成「一方是另一方的后缀」。
        单位写法差异（「伏」vs「V」）在 qNormText 里已归一，不靠这条兜。 */
   const na = a.match(/-?\d+(?:\.\d+)?/g), nb = b.match(/-?\d+(?:\.\d+)?/g);
   if (na && nb && na.length === nb.length && na.length > 0) {
@@ -871,7 +873,16 @@ function qFillMatch(std, user) {
       return scale > 0 && Math.abs(fx - fy) <= scale * 0.01;
     });
     const stripNum = (x) => x.replace(/-?\d+(?:\.\d+)?/g, '');
-    if (ok && stripNum(a) === stripNum(b)) return { hit: true, conf: 0.95, how: '数值近似' };
+    if (ok) {
+      const sa = stripNum(a), sb = stripNum(b);
+      if (sa === sb) return { hit: true, conf: 0.95, how: '数值近似' };
+      /* 表述有省略：标准「PWM数量为16路」vs 考生「16路」→ 去掉数字后
+         「pwm数量为路」vs「路」→ 前者是后者的前缀（多的是修饰语）→ 算对。
+         但「TELEM1」vs「CAN 1」去掉数字是「telem」vs「can」，互不为后缀 → 仍判错。 */
+      if (sa && sb && (sa.endsWith(sb) || sb.endsWith(sa))) {
+        return { hit: true, conf: 0.95, how: '数值近似（表述有省略）' };
+      }
+    }
   }
   return { hit: false, conf: 0.5, how: '不匹配' };
 }
