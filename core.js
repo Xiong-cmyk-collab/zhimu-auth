@@ -2164,7 +2164,11 @@ async function handleQMySubDetail(req, env, subId) {
         confidence: g.confidence, reason: g.reason, needManual: !!g.needManual,
         /* ★ pending=true = AI **没判出来**（服务不可用/超时/解析失败）。
            它跟「判了但判成 0 分」是两回事，界面必须分开显示。 */
-        pending: !!g.pending };
+        pending: !!g.pending,
+        /* ★ quotaHit=true = 这次失败是因为**模型额度/积分用尽**（不是超时、不是解析失败）。
+           以前没往下透传 → 前端和测试都分不清「额度用尽」和「服务偶发挂」，
+           白白把一次额度问题当成偶发故障。 */
+        quotaHit: !!g.quotaHit };
       /* 得分点的文字也要打码 —— 只给编号，文字是答案的一部分 */
       item.hitCount = (g.hits || []).length;
       item.pointCount = Array.isArray(q.points) ? q.points.length : 0;
