@@ -900,20 +900,65 @@ function qFillMatch(std, user) {
    其余 16 道（温度范围、尺寸、针脚定义、电流电压…）全部正确排除。 */
 const Q_ENUM_SEP = /^[、，,和与及或()（）\s]*(?:以及|或者|或|和|与|及|、)[、，,和与及或()（）\s]*$/;
 
+/* ★★ 2026-11-24 用户补充：**相邻空级**判准。
+   原来 qFillOrderFree 是「整题一个开关」：只要有**任何一对**相邻空之间不是
+   纯枚举连接词，整道题都退回按位置判。
+   用户举的反例（Droneer GCS 第 1 题）：
+     「支持的飞控生态包括 ____ 和 ____，并兼容任何使用 ____ 协议通信的自动驾驶仪」
+   → 第 1、2 空之间是「和」（可互换），第 2、3 空之间是「，并兼容任何使用」（必须固定）
+   → 这是一道**混合题**：前两空要能对调，后一空要按位置。
+   原来会被整题判成固定序 → 考生写「PX4 和 ARDUPILOT」就拿不到分。
+
+   现在改成**逐对判断**：qFillFreePairs 返回 free[i]，
+   free[i]=true 表示「第 i 空与第 i+1 空之间是纯枚举连接词 → 这一对可以互换」。
+   再按 free 边把空切成若干组（连续 free 边连起来的空属于同一组），
+   组内做内容完美匹配，组与组之间不乱。 */
+function qFillFreePairs(q) {
+  const blanks = (q && q.blanks) || [];
+  const n = blanks.length;
+  if (n < 2) return [];
+  const answers = blanks.map(function (b) { return String((b && b.answer) || '').trim(); });
+  const stem = String((q && q.stem) || '');
+  const parts = stem.split(/_{3,}/);
+  if (parts.length - 1 !== n) return new Array(n - 1).fill(false);
+  const free = new Array(n - 1).fill(false);
+  for (let i = 0; i < n - 1; i++) {
+    /* 连接词 → 这一对可互换；
+       ★ 且这两个空的标准答案必须**互不相同**（相同的话互换没有意义，
+         按位置判的结果也一样，留给按位置判更稳）。 */
+    if (Q_ENUM_SEP.test(parts[i + 1]) && answers[i] && answers[i + 1] && answers[i] !== answers[i + 1]) {
+      free[i] = true;
+    }
+  }
+  return free;
+}
+
+/* 整题是否「完全可乱序」（所有相邻对都是枚举连接词）。
+   保留给测试脚本与「整题集合匹配」用；真正的判分走下面的分组匹配。 */
 function qFillOrderFree(q) {
   const blanks = (q && q.blanks) || [];
   if (blanks.length < 2) return false;
   const answers = blanks.map(function (b) { return String((b && b.answer) || '').trim(); });
   if (answers.some(function (a) { return !a; })) return false;
-  /* 标准答案有重复 → 不能乱序（否则「5V、5V、GND」这种会被判乱） */
   if (new Set(answers).size !== answers.length) return false;
-  const stem = String((q && q.stem) || '');
-  const parts = stem.split(/_{3,}/);
-  if (parts.length - 1 !== blanks.length) return false;
-  for (let i = 0; i < blanks.length - 1; i++) {
-    if (!Q_ENUM_SEP.test(parts[i + 1])) return false;
-  }
+  const free = qFillFreePairs(q);
+  if (!free.length) return false;
+  for (let i = 0; i < free.length; i++) if (!free[i]) return false;
   return true;
+}
+
+/* 按 free 边把空分组：连续 free 边连起来的空属于同一组（组内可任意排列）。
+   返回 [[0,1],[2],[3,4],…] 这样的下标数组。 */
+function qFillGroups(free) {
+  const groups = [];
+  if (!free || !free.length) return groups;
+  let cur = [0];
+  for (let i = 0; i < free.length; i++) {
+    if (free[i]) { cur.push(i + 1); }
+    else { groups.push(cur); cur = [i + 1]; }
+  }
+  groups.push(cur);
+  return groups;
 }
 
 /* 给「顺序可打乱」的填空题做**内容集合匹配**：
@@ -939,6 +984,50 @@ function qFillSetPair(stds, users) {
     return false;
   }
   return walk(0) ? perm : null;
+}
+
+/* ★★ 分组匹配（2026-11-24 新增）：
+   把可乱序的相邻空按 free 边分组，**每组独立**做内容完美匹配；
+   某组配不上就只让那一组退回按位置判，**不影响其它组**。
+
+   例（Droneer GCS 第 1 题）：
+     标准 [ARDUPILOT, PX4, MAVLink]
+     题干「第 1、2 空之间是『和』，第 2、3 空之间是『，并兼容任何使用』」
+     → free = [true, false] → 分组 [[0,1],[2]]
+     考生 [PX4, ARDUPILOT, MAVLink]
+     → 组 [0,1] 配对成功（0→考生1，1→考生0）；组 [2] 按位置，配上 MAVLink
+     → 全对 ✅
+
+   返回 perm：perm[i] = 第 i 个标准答案对应考生第几空；-1 = 该空按位置判（没配上）。
+   返回 null 表示「没有任何可乱序的组」，调用方直接按位置判。 */
+function qFillGroupPerm(q, userVals) {
+  const blanks = (q && q.blanks) || [];
+  const n = blanks.length;
+  if (n < 2) return null;
+  const free = qFillFreePairs(q);
+  if (!free.some(function (x) { return x; })) return null;
+  const groups = qFillGroups(free);
+  const stds = blanks.map(function (b) { return b.answer; });
+  const perm = new Array(n).fill(-1);
+  /* 先按位置判一遍（后面没配上的组就用这个结果） */
+  for (let i = 0; i < n; i++) {
+    perm[i] = userVals[i] != null && String(userVals[i]).trim() ? i : -1;
+  }
+  let anyGroup = false;
+  for (const g of groups) {
+    if (g.length < 2) continue;      /* 单个空固定位置 */
+    anyGroup = true;
+    const gs = g.map(function (i) { return stds[i]; });
+    const gu = g.map(function (i) { return userVals[i]; });
+    const p = qFillSetPair(gs, gu);
+    if (p) {
+      for (let k = 0; k < g.length; k++) perm[g[k]] = g[p[k]];
+    } else {
+      /* 这组配不上 → 全部退回按位置判（perm 保持原值） */
+      for (let k = 0; k < g.length; k++) perm[g[k]] = g[k];
+    }
+  }
+  return anyGroup ? perm : null;
 }
 
 /* ★ 填空题**部分分**（2026-11-24 用户要求改的）
@@ -1486,12 +1575,23 @@ async function handleQSubmit(req, env) {
       let perm = null;     /* perm[i] = 第 i 个标准答案对应考生第几空 */
       /* ★ 列举型填空题：顺序可以打乱。
          位置没对上，但内容能一一配起来（集合一致）→ 也算全对。
-         例：标准 GPS/GLONASS/BeiDou/Galileo，考生写 Galileo/GPS/BeiDou/GLONASS。 */
-      if (!allHitPos && qFillOrderFree(q)) {
-        perm = qFillSetPair(blanks.map(function (b) { return b.answer; }), userVals);
+         例：标准 GPS/GLONASS/BeiDou/Galileo，考生写 Galileo/GPS/BeiDou/GLONASS。
+
+         ★★ 2026-11-24 升级为**分组匹配**（qFillGroupPerm）：
+         原来只有「整题全乱序」或「整题全按位置」两种。
+         现在按**相邻空之间是不是枚举连接词**逐对判断、切成组，
+         组内可乱序、组间固定 ——
+         像「包括 ____ 和 ____，并兼容任何使用 ____ 协议」这种混合题，
+         前两空对调能判对、后一空仍按位置判。 */
+      if (!allHitPos) {
+        perm = qFillGroupPerm(q, userVals);
         if (perm) {
           for (let i = 0; i < blanks.length; i++) {
-            if (perm[i] >= 0) ms[i] = { hit: true, conf: 1, how: '乱序命中' };
+            const j = perm[i];
+            if (j >= 0 && j !== i) {
+              const m2 = qFillMatch(blanks[i].answer, userVals[j]);
+              if (m2.hit) ms[i] = { hit: true, conf: m2.conf, how: '乱序命中' };
+            }
           }
         }
       }
@@ -1499,8 +1599,10 @@ async function handleQSubmit(req, env) {
       for (let i = 0; i < blanks.length; i++) {
         const m = ms[i];
         /* 乱序命中时，按标准答案的次序显示考生的作答：
-           「第 N 空」永远对应第 N 个标准，管理员一眼看得懂。 */
-        const ju = perm ? userVals[perm[i]] : userVals[i];
+           「第 N 空」永远对应第 N 个标准，管理员一眼看得懂。
+           ★ perm[i] 可能为 -1（该空考生没填）→ 兜底成空串，别取到 undefined。 */
+        const pi = (perm && perm[i] >= 0) ? perm[i] : i;
+        const ju = userVals[pi];
         if (m.hit) hitN++;
         if (m.conf < conf) conf = m.conf;
         detail.push({ id: blanks[i].id, answer: blanks[i].answer, user: String(ju || ''),
