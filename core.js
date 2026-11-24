@@ -2043,7 +2043,9 @@ async function qRetryAllDue(env, onlyName, force) {
       try { await qAfterGrading(env, rec, board, { skipAdminNotify: true }); }
       catch (e) { /* 写成绩失败不影响重判流程 */ }
     }
-    if (r.done) touched.push({ id: rec.id, name: rec.name, board: rec.boardName, score: rec.score, remain: r.remain });
+    /* ★ score 要取 rec.finalScore —— 记录里**没有** score 字段，
+       原来写 rec.score → 通知里出现「AI 建议得分 undefined」（2026-11-24 用户截图发现）。 */
+    if (r.done) touched.push({ id: rec.id, name: rec.name, board: rec.boardName, score: rec.finalScore, total: rec.totalScore, remain: r.remain });
   }
   /* 重判出分的，通知管理员去复核 */
   for (const t of touched) {
@@ -2054,7 +2056,7 @@ async function qRetryAllDue(env, onlyName, force) {
         await qNotify(env, u.name, 'review_new',
           '有考试已重新判分，请复核',
           t.name + ' 的「' + t.board + '」考试刚刚重新判分，AI 建议得分 ' + t.score
-          + '。' + (t.remain ? ('还有 ' + t.remain + ' 道题没判出来。') : '全部题目都判出来了。')
+          + ' / ' + t.total + '。' + (t.remain ? ('还有 ' + t.remain + ' 道题没判出来。') : '全部题目都判出来了。')
           + '请到「待复核」里确认。', '#/review', t.name);
       }
     }
