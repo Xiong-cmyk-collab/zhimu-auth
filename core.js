@@ -3313,6 +3313,44 @@ async function handleQWrongReset(req, env) {
   return json({ ok: true, accounts: accounts, questions: questions, at: at });
 }
 
+/* POST /api/q/admin/wrong-reset-one —— **按账号**清空某个账号的错题本。
+   ★ 用途：题库改版后，旧错题里存的「选了第几项」会跟新选项顺序错位，
+     对着错题本复习反而会记错。owner 指定账号清一次即可。
+   ★ 只清 st.wrong（错题本本体），**不动**：
+       - st.exams 里的 wrongIds / wrongPicks（那是考试明细的历史快照）
+       - st.best（最好成绩）
+       - 其他任何账号
+   ★ 用完即废：执行成功后写标志进 KV，再调直接 404 ——
+     不留「清空某人错题本」的后门（用户一直反对这类批量清除能力）。
+   ★ 同时写 wrongResetAt：客户端据此把**本机缓存**的错题也作废，
+     否则清完服务器，本机一同步又推回来。 */
+async function handleQWrongResetOne(req, env) {
+  const bad = assertSameOrigin(req, env);
+  if (bad) return bad;
+  const owner = await isQuizOwner(req, env);
+  if (!owner) return fail('需要拥有者权限', 403);
+  const flag = await env.KV.get('q:cfg:wrong-reset-one-once', 'json');
+  if (flag && flag.done) return fail('该一次性操作已执行过', 404);
+  let b = {};
+  try { b = await qReadBody(req); } catch (e) { b = {}; }
+  if (String(b.token || '') !== 'WONGRESETONE-20261124') return fail('口令不对', 403);
+  const target = String(b.name || '').trim();
+  if (!target) return fail('缺少 name（要清谁的错题本）');
+
+  const sk = qState(target);
+  const rec = await env.KV.get(sk, 'json');
+  const st = (rec && rec.state && typeof rec.state === 'object') ? rec.state : null;
+  if (!st) return fail('该账号没有答题状态：' + target, 404);
+  const before = (st.wrong && typeof st.wrong === 'object') ? Object.keys(st.wrong).length : 0;
+  st.wrong = {};
+  st.wrongResetAt = Date.now();
+  await env.KV.put(sk, JSON.stringify({ state: st, name: target, at: Date.now() }),
+    { expirationTtl: 60 * 60 * 24 * 365 });
+  await env.KV.put('q:cfg:wrong-reset-one-once',
+    JSON.stringify({ done: true, at: Date.now(), name: target, questions: before }));
+  return json({ ok: true, name: target, questions: before });
+}
+
 /* ---------- 答题站：全员答题数据 ---------- */
 /* 当前题库里真实存在的题号集合。
    题库换版后，老题号（v6x-001…）就成���**孤儿错题** ——
@@ -4520,6 +4558,7 @@ async function route(req, env) {
       return withJson(await handleQSubmissions(req, env, p, sid), req, env);
     }
     if (p === '/api/q/admin/wrong-reset') return withJson(await handleQWrongReset(req, env), req, env);
+    if (p === '/api/q/admin/wrong-reset-one') return withJson(await handleQWrongResetOne(req, env), req, env);
     if (p === '/api/q/admin/qbank') return withJson(await handleQAdminConfig(req, env, 'qbank'), req, env);
     if (p === '/api/q/admin/aicfg') return withJson(await handleQAdminConfig(req, env, 'aicfg'), req, env);
     if (p === '/api/q/admin/quota') return withJson(await handleQAdminQuota(req, env), req, env);
