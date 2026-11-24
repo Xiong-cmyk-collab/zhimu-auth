@@ -1926,18 +1926,33 @@ async function qRetryOne(env, rec, board, now, deadline) {
   let done = 0;
   const still = [];
   const t0 = Date.now();
-  for (const q of qs) {
-    /* 单份预算 + 整轮总预算，谁先到谁停 */
-    if (Date.now() - t0 > Q_RETRY_BUDGET_MS) { still.push(q.id); continue; }
-    if (deadline && Date.now() > deadline) { still.push(q.id); continue; }
-    const raw = rec.answers ? rec.answers[q.id] : '';
-    const g = await qAiGradeShort(env, q, raw);
-    if (g && g.pending) { still.push(q.id); continue; }
-    await env.KV.put(qAiKey(rec.id, q.id), JSON.stringify(g), { expirationTtl: 60 * 60 * 24 * 180 });
-    rec.ai = rec.ai || {};
-    rec.ai[q.id] = g;
-    done++;
-  }
+  /* ★★ **并发判**（4 路）。
+     为什么敢并发：每道题的判定写的是**独立 key** `q:ai:<subId>:<qid>`，
+     2026-11-23 修的「并行判分互相覆盖」那个 bug 就是靠改成独立 key 解决的，
+     现在并发不会互相踩。
+     为什么必须并发：原来是**一道一道串行**判，10 道题要 25~30 秒；
+     管理员点一次「立即重试」可能扫到十几份待判记录 → 4 分钟 → 前端 150 秒先断。
+     并发后一份记录 5~8 秒，几份记录一起也就十几秒。 */
+  const CONC = 4;
+  let cursor = 0;
+  const worker = async function () {
+    for (;;) {
+      const i = cursor++;
+      if (i >= qs.length) return;
+      const q = qs[i];
+      /* 单份预算 + 整轮总预算，谁先到谁停（剩下的留到下一轮） */
+      if (Date.now() - t0 > Q_RETRY_BUDGET_MS) { still.push(q.id); continue; }
+      if (deadline && Date.now() > deadline) { still.push(q.id); continue; }
+      const raw = rec.answers ? rec.answers[q.id] : '';
+      const g = await qAiGradeShort(env, q, raw);
+      if (g && g.pending) { still.push(q.id); continue; }
+      await env.KV.put(qAiKey(rec.id, q.id), JSON.stringify(g), { expirationTtl: 60 * 60 * 24 * 180 });
+      rec.ai = rec.ai || {};
+      rec.ai[q.id] = g;
+      done++;
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
   /* 没轮到 / 还失败的留到下一轮 */
   for (const qid of pend) {
     if (still.indexOf(qid) < 0 && !qs.some(function (q) { return q.id === qid; })) still.push(qid);
