@@ -1911,9 +1911,13 @@ async function handleQReview(req, env, subId) {
 /* ★ 人工已经复核过的（status='reviewed'）一律跳过 ——
    管理员都定稿了，AI 再判一遍把分数改回去才是添乱。 */
 const Q_RETRY_DELAY_MS = 5 * 60 * 60 * 1000;   /* 5 小时 */
-const Q_RETRY_BUDGET_MS = 100000;              /* 一轮重判最多跑 100 秒 */
+const Q_RETRY_BUDGET_MS = 100000;              /* 单份记录一轮重判最多跑 100 秒 */
+const Q_RETRY_TOTAL_BUDGET_MS = 120000;        /* ★ 整轮（所有记录加起来）最多 120 秒 */
+                                             /*   前端按钮超时是 150 秒，超了前端先断。
+                                                force 模式一次可能扫十几份记录，
+                                                不设总预算会跑到一半前端就报超时。 */
 
-async function qRetryOne(env, rec, board, now) {
+async function qRetryOne(env, rec, board, now, deadline) {
   const pend = (rec.pendingAi || []).slice();
   if (!pend.length) return { done: 0, remain: 0, ok: true };
   const qs = ((board && board.questions) || []).filter(function (q) {
@@ -1923,7 +1927,9 @@ async function qRetryOne(env, rec, board, now) {
   const still = [];
   const t0 = Date.now();
   for (const q of qs) {
+    /* 单份预算 + 整轮总预算，谁先到谁停 */
     if (Date.now() - t0 > Q_RETRY_BUDGET_MS) { still.push(q.id); continue; }
+    if (deadline && Date.now() > deadline) { still.push(q.id); continue; }
     const raw = rec.answers ? rec.answers[q.id] : '';
     const g = await qAiGradeShort(env, q, raw);
     if (g && g.pending) { still.push(q.id); continue; }
@@ -1969,12 +1975,16 @@ async function qRetryOne(env, rec, board, now) {
   return { done: done, remain: still.length, ok: true, score: score };
 }
 
-/* 扫全部提交，把到期的重判一遍。onlyName 限定只处理某个人的。 */
-async function qRetryAllDue(env, onlyName) {
+/* 扫全部提交，把**到期**的重判一遍。onlyName 限定只处理某个人的。
+   ★ force=true = **不等倒计时**，现在就把所有还没判出来的题重判一遍
+     （管理员点「立即重试 AI 判分」就是这个语义；
+      自动触发那条路 force=false，仍然只重判到期的，免得每次打开页面就烧额度）。 */
+async function qRetryAllDue(env, onlyName, force) {
   const now = Date.now();
+  const deadline = now + Q_RETRY_TOTAL_BUDGET_MS;
   const list = await env.KV.list({ prefix: 'q:sub:' });
   const qb = await qLoadQbank(env);
-  let scanned = 0, due = 0, skipped = 0, redone = 0, remain = 0;
+  let scanned = 0, due = 0, skipped = 0, redone = 0, remain = 0, notYet = 0, budgetOut = 0;
   const touched = [];
   for (const k of list.keys) {
     const rec = await env.KV.get(k.name, 'json');
@@ -1985,10 +1995,12 @@ async function qRetryAllDue(env, onlyName) {
     if (rec.status === 'reviewed') { skipped++; continue; }
     const pend = rec.pendingAi || [];
     if (!pend.length) continue;
-    if ((rec.retryAt || 0) > now) continue;      /* 还没到重判时间 */
+    /* 没到重判时间：force 模式**照样重判**（这正是「立即重试」的意义） */
+    if (!force && (rec.retryAt || 0) > now) { notYet++; continue; }
+    if (Date.now() > deadline) { budgetOut++; continue; }   /* 整轮预算用完，剩下下轮再说 */
     due++;
     const board = qFindBoard(qb, rec.board);
-    const r = await qRetryOne(env, rec, board, now);
+    const r = await qRetryOne(env, rec, board, now, deadline);
     redone += r.done; remain += r.remain;
     await env.KV.put('q:sub:' + rec.id, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
     /* ★★ 重判**全部成功** → 把成绩正式写进汇总（成绩记录/最好成绩/错题本/通知学生）。
@@ -2016,25 +2028,33 @@ async function qRetryAllDue(env, onlyName) {
       }
     }
   }
-  return { ok: true, scanned: scanned, due: due, skipped: skipped, redone: redone, remain: remain, touched: touched.length };
+  return { ok: true, scanned: scanned, due: due, skipped: skipped, redone: redone, remain: remain,
+    touched: touched.length, forced: !!force, notYet: notYet, budgetOut: budgetOut };
 }
 
 
 
 /* POST /api/q/admin/retry-grading —— 管理员手动触发重判
-   POST /api/q/retry-mine        —— 答题人触发重判自己的 */
+   POST /api/q/retry-mine        —— 答题人触发重判自己的
+   ★ body 里带 {"force":true} = **不等倒计时，现在就重判所有还没判出来的题**。
+     原来只有一个语义（只重判「已到期」的），管理员点「立即重试 AI 判分」
+     在倒计时没到时是空跑 → 弹「没有到期的重判任务」，
+     但用户的预期是「额度恢复了就立刻重判，别等 5 小时」→ 加 force。 */
 async function handleQRetryGrading(req, env, mine) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
+  let b = null;
+  try { b = await qReadBody(req); } catch (e) { b = null; }
+  const force = !!(b && b.force);
   if (mine) {
     const sess = await getQuizSession(req, env);
     if (!sess) return fail('登录已失效，请重新登录', 401);
-    const r = await qRetryAllDue(env, sess.name);
+    const r = await qRetryAllDue(env, sess.name, force);
     return json(r);
   }
   const admin = await isQuizAdmin(req, env);
   if (!admin) return fail('需要管理员权限', 403);
-  const r = await qRetryAllDue(env, null);
+  const r = await qRetryAllDue(env, null, force);
   return json(r);
 }
 
