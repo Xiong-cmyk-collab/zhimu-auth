@@ -2467,7 +2467,13 @@ async function handleQAdminConfig(req, env, what) {
 
   if (what === 'qbank') {
     if (!b || !Array.isArray(b.boards)) return fail('缺少 boards');
-    const rec = { version: String(b.version || ''), boards: b.boards, at: Date.now() };
+    /* ★ series 也要一起存：系列（系列产品）配置在这里面，
+       少了它 /q/paper 就报「没有这个系列」（2026-11-24 踩过）。 */
+    const rec = {
+      version: String(b.version || ''), boards: b.boards,
+      series: Array.isArray(b.series) ? b.series : [],
+      at: Date.now()
+    };
     const text = JSON.stringify(rec);
     /* 压缩优先；运行环境没有 CompressionStream 就退回明文分块 */
     const canGzip = (typeof CompressionStream !== 'undefined');
