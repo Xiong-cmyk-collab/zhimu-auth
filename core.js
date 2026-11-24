@@ -1196,6 +1196,17 @@ async function qNotify(env, name, type, title, body, link, who) {
   }
 }
 
+/* 把时间戳格式成「11-24 16:02」这种能直接塞进通知正文的样子。
+   ★ Deno Deploy 跑在 UTC，国内用户看服务器本地时间会差 8 小时，
+     所以这里**显式按 UTC+8** 换算，不依赖部署环境的时区设置。 */
+function qFmtClock(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const d = new Date(n + 8 * 60 * 60 * 1000);   /* 先偏移成 UTC+8 的"墙上时间" */
+  const p = function (x) { return String(x).padStart(2, '0'); };
+  return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+}
+
 /* ---------- 题库存取（gzip + base64 + 分块） ----------
    ★ Deno KV 单个 value 上限 64 KiB，100 题 × 2 板块的题库 JSON 有 ~190 KB，
      直接存会报 "Value too large (max 65536 bytes)"。
@@ -1670,6 +1681,28 @@ async function handleQFinish(req, env) {
   rec.pendingAi = stillPend;
   rec.retryAt = stillPend.length ? (rec.retryAt || (Date.now() + Q_RETRY_DELAY_MS)) : null;
   await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+
+  /* ★★ AI 判分服务不可用（额度用尽 / 限流 / 超时）→ **给学生发一条站内通知**。
+     原来 pending>0 时直接跳过 qAfterGrading → 学生交完卷**一条通知都收不到**，
+     像什么都没发生过，也不知道那几道简答题的分去哪了。
+     文案（2026-11-24 用户逐字确认）：
+       标题「简答题暂时没判出分」
+       正文「你刚提交的「{板块}」考试，选择题和填空题已经判完，但 {n} 道简答题暂时没判出分
+             （AI 判分服务不可用），先记 0 分。系统会在 {恢复时间} 自动重判；
+             管理员复核后会在「我的考试记录」里给出最终成绩。」
+     ★ rec.pendingNotified 防重复：finish 可能被调用多次（前端重试 / 重判后再 finish），
+       只发一条，别把学生的通知刷屏。 */
+  if (pending > 0 && !rec.pendingNotified) {
+    const resetTxt = qFmtClock(rec.retryAt);
+    await qNotify(env, rec.name, 'grading_pending', '简答题暂时没判出分',
+      '你刚提交的「' + rec.boardName + '」考试，选择题和填空题已经判完，但 ' + pending
+      + ' 道简答题暂时没判出分（AI 判分服务不可用），先记 0 分。'
+      + '系统会在 ' + (resetTxt || '稍后') + ' 自动重判；'
+      + '管理员复核后会在「我的考试记录」里给出最终成绩。',
+      '#/');
+    rec.pendingNotified = true;
+    await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  }
 
   if (!pending) await qAfterGrading(env, rec, board);
   return json({
