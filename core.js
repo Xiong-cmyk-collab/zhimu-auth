@@ -635,9 +635,27 @@ const Q_AICFG = 'q:aicfg';
 const qNotice = (name) => `q:notice:${encodeURIComponent(String(name || '').trim().toLowerCase())}`;
 const NOTICE_MAX = 100;          /* 最多存多少条（新的在前） */
 
+/* ★★ 2026-11-25 用户铁律：「默认一律不删真人记录」。
+ *
+ *   下面这几类数据**一律不设过期时间**（put 不传 expirationTtl = 永久保留）：
+ *     q:sub:<id>   考试记录（原来 180 天）
+ *     q:ai:<sub>:<qid>  AI 判分结果（原来 180 天）
+ *     q:state:<name>   错题本 / 最好成绩 / 考试记录索引（原来 365 天）
+ *
+ *   为什么改：这些 TTL 是当初随手写的，**没有任何人要求它们过期**。
+ *   实际上它们只会在「用户自己删考试记录」时才会被清理（core.js 里
+ *   有 qSyncAfterExamRemoved / qCleanOrphanBest 跟着删），
+ *   留着 TTL 只会让真人记录在没人察觉的时候消失 —— 与铁律直接冲突。
+ *
+ *   存储成本不用担心：一张答卷记录约 1~2 KB，一年 1000 场也就 2 MB。 */
+
 /* 写通知数组：不设过期（永久保留），并按字节兜底别撑爆 KV 单值 64 KB */
 async function qNoticePut(env, key, arr) {
-  const keep = arr.slice(0, NOTICE_MAX);
+  /* ★ 2026-11-25 修：这里原来写的是 const keep，下面的 keep = keep.slice(...) 其实是
+     给常量重新赋值。Deno 里这行只有在通知数组超长（>48 KB）时才会走到，
+     所以一直没暴露；EdgeOne Makers 的打包器（esbuild）在**静态检查阶段**
+     就把它判成错误，整个构建直接失败。改成 let 即可，行为完全不变。 */
+  let keep = arr.slice(0, NOTICE_MAX);
   let s = JSON.stringify(keep);
   while (keep.length > 1 && s.length > 48000) {
     keep = keep.slice(0, keep.length - 1);
@@ -1653,7 +1671,7 @@ async function handleQSubmit(req, env) {
     status: needGrade.length ? 'grading' : 'pending_review',
     finalScore: null, confidence: null
   };
-  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec));
   if (paper) { try { await env.KV.delete('q:paper:' + paper.id); } catch (e) { /* 用完即删 */ } }
 
   if (!needGrade.length) {
@@ -1661,7 +1679,7 @@ async function handleQSubmit(req, env) {
     rec.status = 'pending_review';
     rec.finalScore = autoScore;
     rec.confidence = 100;
-    await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+    await env.KV.put('q:sub:' + subId, JSON.stringify(rec));
     await qAfterGrading(env, rec, board);
   }
   return json({
@@ -1699,7 +1717,7 @@ async function handleQGradeOne(req, env) {
   const raw = rec.answers ? rec.answers[qid] : '';
   const g = await qAiGradeShort(env, q, raw);
   /* ★ 写独立 key（并发安全） */
-  await env.KV.put(qAiKey(subId, qid), JSON.stringify(g), { expirationTtl: 60 * 60 * 24 * 180 });
+  await env.KV.put(qAiKey(subId, qid), JSON.stringify(g));
   /* 考试记录里也同步一份（调试/兜底用；不再作为唯一真源） */
   rec.ai = rec.ai || {};
   rec.ai[qid] = g;
@@ -1711,7 +1729,7 @@ async function handleQGradeOne(req, env) {
   } else {
     rec.pendingAi = rec.pendingAi.filter(function (x) { return x !== qid; });
   }
-  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec));
   return json({ ok: true, qid: qid, result: g });
 }
 
@@ -1785,7 +1803,7 @@ async function handleQFinish(req, env) {
   }
   rec.pendingAi = stillPend;
   rec.retryAt = stillPend.length ? (rec.retryAt || (Date.now() + Q_RETRY_DELAY_MS)) : null;
-  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec));
 
   /* ★★ AI 判分服务不可用（额度用尽 / 限流 / 超时）→ **给学生发一条站内通知**。
      原来 pending>0 时直接跳过 qAfterGrading → 学生交完卷**一条通知都收不到**，
@@ -1806,7 +1824,7 @@ async function handleQFinish(req, env) {
       + '管理员复核后会在「我的考试记录」里给出最终成绩。',
       '#/');
     rec.pendingNotified = true;
-    await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+    await env.KV.put('q:sub:' + subId, JSON.stringify(rec));
   }
 
   if (!pending) await qAfterGrading(env, rec, board);
@@ -1972,8 +1990,7 @@ async function qAfterGrading(env, rec, board, opts) {
     if (!curBest || rec.finalScore > curBest.score) {
       st.best[rec.board] = { score: rec.finalScore, total: rec.totalScore, at: rec.at };
     }
-    await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
-      { expirationTtl: 60 * 60 * 24 * 365 });
+    await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }));
   } catch (e) { /* 写成绩失败不影响主流程 */ }
 
   /* 通知管理员/拥有者 */
@@ -2152,8 +2169,7 @@ async function handleQSubDelete(req, env, subId) {
           if (rec && rec.name === nm) qSyncAfterExamRemoved(st, rec, board);
           qCleanOrphanBest(st);
           cleaned.push(nm);
-          await env.KV.put(sk, JSON.stringify({ state: st, name: nm, at: Date.now() }),
-            { expirationTtl: 60 * 60 * 24 * 365 });
+          await env.KV.put(sk, JSON.stringify({ state: st, name: nm, at: Date.now() }));
         }
       }
     } catch (e) { /* 忽略 */ }
@@ -2205,7 +2221,7 @@ async function handleQReview(req, env, subId) {
   rec.finalScore = score;
   rec.status = 'reviewed';
   rec.review = { by: admin.name, at: Date.now() };
-  await env.KV.put('q:sub:' + subId, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+  await env.KV.put('q:sub:' + subId, JSON.stringify(rec));
 
   /* 同步更新用户成绩记录里的分数
      ★ 原来是「只在已有条目上 forEach 改分数」，条目不存在就什么都不做。
@@ -2241,8 +2257,7 @@ async function handleQReview(req, env, subId) {
     if (!curBest || score > (Number(curBest.score) || 0)) {
       st.best[rec.board] = { score: score, total: rec.totalScore, at: rec.at };
     }
-    await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }),
-      { expirationTtl: 60 * 60 * 24 * 365 });
+    await env.KV.put(key, JSON.stringify({ state: st, name: rec.name, at: Date.now() }));
   } catch (e) { /* 忽略 */ }
 
   await qNotify(env, rec.name, 'review_done', '考试评价已完成',
@@ -2292,7 +2307,7 @@ async function qRetryOne(env, rec, board, now, deadline, qb) {
       const raw = rec.answers ? rec.answers[q.id] : '';
       const g = await qAiGradeShort(env, q, raw);
       if (g && g.pending) { still.push(q.id); continue; }
-      await env.KV.put(qAiKey(rec.id, q.id), JSON.stringify(g), { expirationTtl: 60 * 60 * 24 * 180 });
+      await env.KV.put(qAiKey(rec.id, q.id), JSON.stringify(g));
       rec.ai = rec.ai || {};
       rec.ai[q.id] = g;
       done++;
@@ -2374,7 +2389,7 @@ async function qRetryAllDue(env, onlyName, force) {
     const board = qFindBoard(qb, rec.board);
     const r = await qRetryOne(env, rec, board, now, deadline, qb);
     redone += r.done; remain += r.remain;
-    await env.KV.put('q:sub:' + rec.id, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 180 });
+    await env.KV.put('q:sub:' + rec.id, JSON.stringify(rec));
     /* ★★ 重判**全部成功** → 把成绩正式写进汇总（成绩记录/最好成绩/错题本/通知学生）。
        为什么必须在这里补：AI 不可用时 finish 不调 qAfterGrading（还有题没判出来，
        分数没定，不能写进成绩库）；如果重判成功后也没人补写，
@@ -2493,8 +2508,7 @@ async function handleQMySubDelete(req, env, subId) {
          否则卡片上还挂着「最好 120/150」「错题 1」，看着像没删干净。 */
       if (removed > 0 && rec) qSyncAfterExamRemoved(st, rec, board);
       qCleanOrphanBest(st);
-      await env.KV.put(sk, JSON.stringify({ state: st, name: sess.name, at: Date.now() }),
-        { expirationTtl: 60 * 60 * 24 * 365 });
+      await env.KV.put(sk, JSON.stringify({ state: st, name: sess.name, at: Date.now() }));
     }
   } catch (e) { /* 忽略 */ }
 
@@ -3314,8 +3328,7 @@ async function handleQWrongReset(req, env) {
     st.wrong = {};
     st.wrongResetAt = at;
     accounts++;
-    await env.KV.put(sk, JSON.stringify({ state: st, name: u.name, at: at }),
-      { expirationTtl: 60 * 60 * 24 * 365 });
+    await env.KV.put(sk, JSON.stringify({ state: st, name: u.name, at: at }));
   }
   await env.KV.put('q:cfg:wrong-reset-once',
     JSON.stringify({ done: true, at: at, accounts: accounts, questions: questions }));
@@ -3353,8 +3366,7 @@ async function handleQWrongResetOne(req, env) {
   const before = (st.wrong && typeof st.wrong === 'object') ? Object.keys(st.wrong).length : 0;
   st.wrong = {};
   st.wrongResetAt = Date.now();
-  await env.KV.put(sk, JSON.stringify({ state: st, name: target, at: Date.now() }),
-    { expirationTtl: 60 * 60 * 24 * 365 });
+  await env.KV.put(sk, JSON.stringify({ state: st, name: target, at: Date.now() }));
   await env.KV.put('q:cfg:wrong-reset-one-once',
     JSON.stringify({ done: true, at: Date.now(), name: target, questions: before }));
   return json({ ok: true, name: target, questions: before });
