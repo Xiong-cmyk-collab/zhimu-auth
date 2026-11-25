@@ -6,7 +6,7 @@
   "tasks": {
     "dev": "deno run --unstable-kv --allow-net --allow-env --allow-read --allow-write main.ts",
     "cron": {
-      "retrygrading": "*/5 * * * *"
+      "retrygrading": "0 * * * *"
     }
   }
 }

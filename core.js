@@ -1355,9 +1355,12 @@ async function qGatherAi(env, subId, qids, fallback) {
 }
 /* ★ 题库进程内缓存：题库是 gzip 分块存的，每次读都要拉 4 个 KV 块再解压，
    复核详情页一次要读好几遍（列表、判分、详情），没有缓存要等 3~5 秒。
-   60 秒过期，写题库时立刻失效。 */
+   60 秒过期，写题库时立刻失效。
+   ★ 2026-11-25 额度优化：60 秒 → 300 秒。
+     Deno Deploy 免费版 KV 读上限 45 万/月，题库每次缓存失效都要 3 次 KV 读 + 解压 538KB。
+     题库一天也改不了几次，5 分钟缓存完全够用，KV 读直接降到 1/5。 */
 let Q_QBANK_CACHE = null;
-const Q_QBANK_CACHE_MS = 60000;
+const Q_QBANK_CACHE_MS = 300000;
 
 async function qLoadQbank(env) {
   const now = Date.now();
@@ -2346,7 +2349,12 @@ async function qRetryAllDue(env, onlyName, force) {
   const now = Date.now();
   const deadline = now + Q_RETRY_TOTAL_BUDGET_MS;
   const list = await env.KV.list({ prefix: 'q:sub:' });
-  const qb = await qLoadQbank(env);
+  /* ★ 2026-11-25 额度优化：题库**懒加载**。
+     原来每次 cron 都 qLoadQbank（3 次 KV 读 + 解压 538KB JSON），
+     但绝大多数记录 pendingAi 是空的、根本不需要题库。
+     改成「真的要重判时才加载」—— 大多数轮次 0 次 KV 读。
+     cron 每小时跑一次 → 每天 24 次，省下来的 KV 读很可观。 */
+  let qb = null;
   let scanned = 0, due = 0, skipped = 0, redone = 0, remain = 0, notYet = 0, budgetOut = 0;
   const touched = [];
   for (const k of list.keys) {
@@ -2362,6 +2370,7 @@ async function qRetryAllDue(env, onlyName, force) {
     if (!force && (rec.retryAt || 0) > now) { notYet++; continue; }
     if (Date.now() > deadline) { budgetOut++; continue; }   /* 整轮预算用完，剩下下轮再说 */
     due++;
+    if (!qb) qb = await qLoadQbank(env);   /* ← 懒加载：只有真的要判分时才读题库 */
     const board = qFindBoard(qb, rec.board);
     const r = await qRetryOne(env, rec, board, now, deadline, qb);
     redone += r.done; remain += r.remain;
@@ -3633,14 +3642,25 @@ async function handleQPing(req, env) {
 }
 
 /* ---------- 答题站：在线情况（管理员） ---------- */
+/* ★ 2026-11-25 额度优化：在线列表加 30 秒进程内缓存。
+   原来每个会话要读 4 次 KV（sess + uid + name + user），
+   会话一多这个接口就要 22~30 秒 —— 慢、还烧 KV 读额度。
+   在线状态本来就允许几十秒延迟，缓存 30 秒完全够。 */
+let Q_ONLINE_CACHE = null;
+const Q_ONLINE_CACHE_MS = 30000;
+
 async function handleQAdminOnline(req, env) {
   const bad = assertSameOrigin(req, env);
   if (bad) return bad;
   const admin = await isQuizAdmin(req, env);
   if (!admin) return fail('需要管理员权限', 403);
 
-  const list = await env.KV.list({ prefix: 'q:sess:' });
   const now = Date.now();
+  if (Q_ONLINE_CACHE && (now - Q_ONLINE_CACHE.at) < Q_ONLINE_CACHE_MS) {
+    return json({ ok: true, online: Q_ONLINE_CACHE.rows, cached: true });
+  }
+
+  const list = await env.KV.list({ prefix: 'q:sess:' });
   const rows = [];
   for (const k of list.keys) {
     const s = await env.KV.get(k.name, 'json');
@@ -3661,6 +3681,7 @@ async function handleQAdminOnline(req, env) {
     });
   }
   rows.sort((a, b) => b.lastSeen - a.lastSeen);
+  Q_ONLINE_CACHE = { at: now, rows: rows };
   return json({ ok: true, online: rows });
 }
 
